@@ -1,0 +1,992 @@
+openapi: 3.1.0
+info:
+  title: MOBIE API
+  version: 0.1.0
+  summary: Reference contract for the MOBIE HTTP API.
+  description: |
+    Machine-readable API description for the MOBIE endpoints currently documented in this repository.
+
+    This specification focuses on the observed HTTP contract:
+    - authentication flow
+    - required headers
+    - collection pagination
+    - common response envelope
+
+    Several payloads are only partially known. Where the contract is incomplete, schemas allow
+    additional properties.
+servers:
+  - url: https://pgm.mobie.pt
+    description: Production
+tags:
+  - name: Auth
+  - name: Locations
+  - name: Sessions
+  - name: Tokens
+  - name: Logs
+paths:
+  /api/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              default:
+                value:
+                  email: user@example.com
+                  password: secret
+      responses:
+        '200':
+          description: Login succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+            examples:
+              default:
+                value:
+                  refresh_token: refresh-token
+      responses:
+        '200':
+          description: Token refresh succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/locations:
+    get:
+      tags: [Locations]
+      summary: List locations
+      operationId: listLocations
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            examples: [0]
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            examples: [0]
+      responses:
+        '200':
+          description: Locations returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocationListEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/locations/{locationId}:
+    get:
+      tags: [Locations]
+      summary: Get location
+      operationId: getLocation
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: locationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Location returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocationEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/locations/analytics:
+    get:
+      tags: [Locations]
+      summary: Get location analytics
+      operationId: getLocationAnalytics
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: Location analytics returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocationAnalyticsEnvelope'
+  /api/locations/geojson:
+    get:
+      tags: [Locations]
+      summary: Get location GeoJSON
+      operationId: getLocationGeoJson
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: GeoJSON payload returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoJsonEnvelope'
+  /api/sessions:
+    get:
+      tags: [Sessions]
+      summary: List sessions
+      operationId: listSessions
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: locationId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: dateFrom
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: dateTo
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Sessions returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionListEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/tokens:
+    get:
+      tags: [Tokens]
+      summary: List tokens
+      operationId: listTokens
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Tokens returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenListEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/logs/ocpp:
+    get:
+      tags: [Logs]
+      summary: List OCPP logs
+      operationId: listOcppLogs
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: error
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: When true, returns error logs only.
+      responses:
+        '200':
+          description: OCPP logs returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OcppLogListEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/logs/ocpi:
+    get:
+      tags: [Logs]
+      summary: List OCPI logs
+      operationId: listOcpiLogs
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: OCPI logs returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OcppLogListEnvelope'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /api/entities/{entityCode}:
+    get:
+      tags: [Auth]
+      summary: Get entity
+      operationId: getEntity
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+      parameters:
+        - name: entityCode
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Entity returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityEnvelope'
+  /api/identity/roles/{roleName}:
+    get:
+      tags: [Auth]
+      summary: Get role
+      operationId: getRole
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      parameters:
+        - name: roleName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Role returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleEnvelope'
+  /api/ords:
+    get:
+      tags: [Sessions]
+      summary: List ORDs
+      operationId: listOrds
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: ORDs returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrdListEnvelope'
+  /api/ords/statistics:
+    get:
+      tags: [Sessions]
+      summary: Get ORD statistics
+      operationId: getOrdStatistics
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: ORD statistics returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrdStatisticsEnvelope'
+  /api/ords/cpesIntegrated:
+    get:
+      tags: [Sessions]
+      summary: List integrated CPEs
+      operationId: listIntegratedCpes
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: Integrated CPEs returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrdListEnvelope'
+  /api/ords/cpesToIntegrate:
+    get:
+      tags: [Sessions]
+      summary: List CPEs pending integration
+      operationId: listCpesToIntegrate
+      security:
+        - MobieBearerAuth: []
+          MobieUserHeader: []
+          MobieProfileHeader: []
+      responses:
+        '200':
+          description: CPEs pending integration returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrdListEnvelope'
+components:
+  securitySchemes:
+    MobieBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer access token returned by /api/login or /api/refresh.
+    MobieUserHeader:
+      type: apiKey
+      in: header
+      name: user
+      description: User email associated with the authenticated session.
+    MobieProfileHeader:
+      type: apiKey
+      in: header
+      name: profile
+      description: User profile associated with the authenticated session.
+  responses:
+    ErrorResponse:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/EnvelopeMetadata'
+              - type: object
+                additionalProperties: true
+  schemas:
+    EnvelopeMetadata:
+      type: object
+      properties:
+        status_code:
+          type: integer
+          nullable: true
+        status_message:
+          type: string
+          nullable: true
+        timestamp:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+      additionalProperties: false
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+      additionalProperties: false
+    EnvelopeBase:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          properties:
+            data: {}
+          required: [data]
+    LoginEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/LoginResponse'
+    LocationListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Location'
+    LocationEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/Location'
+    LocationAnalyticsEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/LocationAnalytics'
+    GeoJsonEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/GeoJsonValue'
+    SessionListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Session'
+    TokenListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Token'
+    OcppLogListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/OcppLogEntry'
+    EntityEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/Entity'
+    RoleEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/Role'
+    OrdListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Ord'
+    OrdStatisticsEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/EnvelopeMetadata'
+        - type: object
+          required: [data]
+          properties:
+            data:
+              $ref: '#/components/schemas/OrdStatistics'
+    LoginResponse:
+      type: object
+      required: [bearer, user]
+      properties:
+        bearer:
+          $ref: '#/components/schemas/Bearer'
+        user:
+          $ref: '#/components/schemas/User'
+      additionalProperties: false
+    Bearer:
+      type: object
+      required: [access_token]
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          nullable: true
+        refresh_expires_in:
+          type: integer
+          nullable: true
+        refresh_token:
+          type: string
+          nullable: true
+        token_type:
+          type: string
+          nullable: true
+        id_token:
+          type: string
+          nullable: true
+        not-before-policy:
+          type: integer
+          nullable: true
+        session_state:
+          type: string
+          nullable: true
+        scope:
+          type: string
+          nullable: true
+      additionalProperties: true
+    User:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+        entity:
+          type: string
+          nullable: true
+        roles:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/UserRole'
+      additionalProperties: true
+    UserRole:
+      type: object
+      properties:
+        profile:
+          type: string
+          nullable: true
+        role:
+          type: string
+          nullable: true
+        name:
+          type: string
+          nullable: true
+      additionalProperties: true
+    Location:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+      required: [id]
+      additionalProperties: true
+    LocationAnalytics:
+      type: object
+      properties:
+        locationsTotalCount:
+          type: integer
+        evsesTotalCount:
+          type: integer
+        connectorsTotalCount:
+          type: integer
+        locsInUseTotalCount:
+          type: integer
+        evsesInUseTotalCount:
+          type: integer
+        locationsByConnectivity:
+          type: array
+          items:
+            $ref: '#/components/schemas/CountBucket'
+        evsesByStatus:
+          type: array
+          items:
+            $ref: '#/components/schemas/CountBucket'
+      additionalProperties: true
+    CountBucket:
+      type: object
+      properties:
+        _id:
+          type: string
+        count:
+          type: integer
+      additionalProperties: true
+    GeoJsonValue:
+      oneOf:
+        - type: object
+          properties:
+            type:
+              type: string
+            features:
+              type: array
+              items:
+                $ref: '#/components/schemas/GeoJsonFeature'
+          additionalProperties: true
+        - type: object
+          additionalProperties: true
+    Session:
+      type: object
+      required: [id, start_date_time]
+      properties:
+        id:
+          type: string
+        start_date_time:
+          type: string
+          format: date-time
+        end_date_time:
+          type: string
+          format: date-time
+          nullable: true
+        kwh:
+          type: number
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        location_id:
+          type: string
+          nullable: true
+        evse_uid:
+          type: string
+          nullable: true
+        connector_id:
+          type: string
+          nullable: true
+        pdgrTransactionId:
+          oneOf:
+            - type: integer
+            - type: string
+            - type: object
+            - type: array
+            - type: 'null'
+        cdr_token:
+          allOf:
+            - $ref: '#/components/schemas/CdrToken'
+          nullable: true
+        charging_periods:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/ChargingPeriod'
+      additionalProperties: true
+    CdrToken:
+      type: object
+      properties:
+        uid:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+        contract_id:
+          type: string
+          nullable: true
+        pdgrPartyId:
+          type: string
+          nullable: true
+        pdgrVisualNumber:
+          type: string
+          nullable: true
+      additionalProperties: true
+    ChargingPeriod:
+      type: object
+      required: [start_date_time]
+      properties:
+        start_date_time:
+          type: string
+          format: date-time
+        dimensions:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/Dimension'
+        tariff_id:
+          type: string
+          nullable: true
+      additionalProperties: true
+    Dimension:
+      type: object
+      required: [type, volume]
+      properties:
+        type:
+          type: string
+        volume:
+          oneOf:
+            - type: number
+            - type: string
+      additionalProperties: true
+    Token:
+      type: object
+      properties:
+        uid:
+          type: string
+          nullable: true
+        token_uid:
+          type: string
+          nullable: true
+      additionalProperties: true
+    OcppLogEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          nullable: true
+        messageType:
+          type: string
+          nullable: true
+        direction:
+          type: string
+          nullable: true
+        timestamp:
+          type: string
+          format: date-time
+          nullable: true
+        logs:
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items: {}
+            - type: 'null'
+      additionalProperties: true
+    GeoJsonFeature:
+      type: object
+      properties:
+        type:
+          type: string
+        geometry:
+          type: object
+          additionalProperties: true
+        properties:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    Entity:
+      type: object
+      properties:
+        name:
+          type: string
+        code:
+          type: string
+        countryCode:
+          type: string
+        fiscalNumber:
+          oneOf:
+            - type: string
+            - type: integer
+        vatCode:
+          oneOf:
+            - type: integer
+            - type: string
+        emsp:
+          type: boolean
+        cpo:
+          type: boolean
+        dpc:
+          type: boolean
+        cse:
+          type: boolean
+        frontendMobie:
+          type: boolean
+        frontendEmsp:
+          type: boolean
+        frontendCpo:
+          type: boolean
+        frontendOrd:
+          type: boolean
+        frontendDpc:
+          type: boolean
+        frontendCse:
+          type: boolean
+        frontendMun:
+          type: boolean
+        partyIds:
+          type: array
+          items: {}
+        mobieNetworkConnection:
+          type: boolean
+        tokenRepresentation:
+          type: string
+      additionalProperties: true
+    Role:
+      type: object
+      properties:
+        profile:
+          type: string
+        role:
+          type: string
+        name:
+          type: string
+        frontend:
+          type: boolean
+        modules:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModulePermission'
+      additionalProperties: true
+    ModulePermission:
+      type: object
+      properties:
+        name:
+          type: string
+        read:
+          type: boolean
+        write:
+          type: boolean
+        delete:
+          type: boolean
+        operate:
+          type: boolean
+      additionalProperties: true
+    Ord:
+      type: object
+      properties:
+        cpe:
+          type: string
+        cpeStatus:
+          type: string
+        requestDate:
+          type: string
+          format: date-time
+        integrationDate:
+          type: string
+          format: date-time
+        location_id:
+          type: string
+        area:
+          type: string
+        entityCode:
+          type: string
+        tax_number:
+          oneOf:
+            - type: string
+            - type: integer
+        voltage_level:
+          type: string
+        location_active:
+          type: boolean
+        mobie_network:
+          type: boolean
+      additionalProperties: true
+    OrdStatistics:
+      type: object
+      properties:
+        cpesTotalCount:
+          type: integer
+        cpesCount:
+          type: object
+          additionalProperties:
+            type: integer
+      additionalProperties: true

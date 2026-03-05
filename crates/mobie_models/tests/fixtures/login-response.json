@@ -1,0 +1,20 @@
+{
+  "data": {
+    "bearer": {
+      "access_token": "test-access-token"
+    },
+    "user": {
+      "email": "user@example.com",
+      "roles": [
+        {
+          "profile": "DPC",
+          "role": "OPERATOR",
+          "name": "Operator"
+        }
+      ]
+    }
+  },
+  "status_code": 1000,
+  "status_message": "Success",
+  "timestamp": "2025-01-01T00:00:00Z"
+}

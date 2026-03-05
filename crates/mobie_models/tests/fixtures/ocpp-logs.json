@@ -1,0 +1,14 @@
+{
+  "data": [
+    {
+      "id": "log-1",
+      "messageType": "MeterValues",
+      "direction": "Request",
+      "timestamp": "2025-10-10T10:05:00Z",
+      "logs": "{\"transactionId\":123,\"meterValue\":[]}"
+    }
+  ],
+  "status_code": 1000,
+  "status_message": "Success",
+  "timestamp": "2025-10-10T12:00:00Z"
+}

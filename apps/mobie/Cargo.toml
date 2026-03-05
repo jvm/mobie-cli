@@ -1,0 +1,23 @@
+[package]
+name = "mobie"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mobie_api = { path = "../../crates/mobie_api" }
+mobie_models = { path = "../../crates/mobie_models" }
+chrono.workspace = true
+clap.workspace = true
+keyring.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+wiremock.workspace = true

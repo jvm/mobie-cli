@@ -1,0 +1,33 @@
+{
+  "data": [
+    {
+      "id": "sess-1",
+      "start_date_time": "2025-10-10T10:00:00Z",
+      "end_date_time": "2025-10-10T11:00:00Z",
+      "kwh": 5.0,
+      "status": "COMPLETED",
+      "location_id": "EVSE-1",
+      "evse_uid": "EVSE-UID-1",
+      "connector_id": "1",
+      "cdr_token": {
+        "uid": "token-1",
+        "type": "RFID",
+        "contract_id": "C-1"
+      },
+      "charging_periods": [
+        {
+          "start_date_time": "2025-10-10T10:00:00Z",
+          "dimensions": [
+            {
+              "type": "ENERGY",
+              "volume": 1.0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "status_code": 1000,
+  "status_message": "Success",
+  "timestamp": "2025-10-10T12:00:00Z"
+}
