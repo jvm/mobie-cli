@@ -89,6 +89,57 @@ async fn cache_miss_writes_sqlite_and_offline_hit_reuses_same_json_output() {
 }
 
 #[tokio::test]
+async fn schema_contains_cache_meta_and_sync_windows() {
+    let cache_dir = tempdir().unwrap();
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    mock_login(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/locations"))
+        .and(query_param("limit", "0"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{ "id": "LOC-1" }],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let output = cli(&base_url, cache_dir.path())
+        .args(["--json", "locations", "list"])
+        .output()
+        .expect("seed run");
+    assert!(output.status.success());
+
+    let conn = Connection::open(cache_dir.path().join("cache.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap();
+    let table_names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    for expected in [
+        "cache_entries",
+        "locations",
+        "sessions",
+        "ocpp_logs",
+        "cache_meta",
+        "sync_windows",
+    ] {
+        assert!(
+            table_names.iter().any(|name| name == expected),
+            "expected table {expected} to exist, tables were {table_names:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn different_query_parameters_create_distinct_cache_entries() {
     let cache_dir = tempdir().unwrap();
     let server = MockServer::start().await;

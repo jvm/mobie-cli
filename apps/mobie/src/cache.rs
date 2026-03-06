@@ -13,6 +13,7 @@ use serde_json::Value;
 
 const CACHE_ENV_DIR: &str = "MOBIE_CACHE_DIR";
 const CACHE_DB_NAME: &str = "cache.db";
+const CACHE_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct CacheLookup {
@@ -129,6 +130,10 @@ impl CacheStore {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS cache_meta (
+                 key TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS cache_entries (
                  key TEXT PRIMARY KEY,
                  resource TEXT NOT NULL,
@@ -211,6 +216,17 @@ impl CacheStore {
                  expires_at INTEGER NOT NULL,
                  PRIMARY KEY (base_url, user_email, profile, resource, scope)
              );
+             CREATE TABLE IF NOT EXISTS sync_windows (
+                 resource TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 window_start TEXT,
+                 window_end TEXT,
+                 last_success_epoch_ms INTEGER,
+                 last_attempt_epoch_ms INTEGER,
+                 status TEXT NOT NULL,
+                 error_json TEXT,
+                 PRIMARY KEY (resource, scope, window_start, window_end)
+             );
              CREATE INDEX IF NOT EXISTS idx_cache_entries_scope_resource
                  ON cache_entries(scope, resource);
              CREATE INDEX IF NOT EXISTS idx_locations_scope ON locations(scope);
@@ -220,6 +236,18 @@ impl CacheStore {
              CREATE INDEX IF NOT EXISTS idx_json_resources_scope ON json_resources(scope);",
         )
         .map_err(|err| format!("failed to initialize cache schema: {err}"))?;
+
+        let schema_value = serde_json::json!({
+            "version": CACHE_SCHEMA_VERSION,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO cache_meta (key, value_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            params!["schema_version", schema_value],
+        )
+        .map_err(|err| format!("failed to record cache schema version: {err}"))?;
 
         Ok(Self { conn })
     }
