@@ -294,6 +294,25 @@ struct SuccessEnvelope<'a, T> {
 #[derive(Debug, Serialize)]
 struct Meta {
     count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness: Option<FreshnessMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct FreshnessMeta {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    as_of_epoch_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_at_epoch_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stale_after_epoch_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,6 +331,20 @@ struct ErrorPayload<'a> {
     url: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
+}
+
+fn success_envelope<'a, T: Serialize>(
+    resource: &'a str,
+    data: &'a T,
+    count: usize,
+    freshness: Option<FreshnessMeta>,
+) -> SuccessEnvelope<'a, T> {
+    SuccessEnvelope {
+        ok: true,
+        resource,
+        data,
+        meta: Some(Meta { count, freshness }),
+    }
 }
 
 #[derive(Debug)]
@@ -706,27 +739,110 @@ async fn execute_cached_log_command<S: SessionStore>(
         LogCommand::List { limit, error_only } => {
             let limit = *limit;
             let error_only = *error_only;
-            Ok(Output::Logs(
-                cached_fetch(
-                    cli,
-                    store,
-                    cache,
-                    CacheSpec {
-                        resource: "logs",
-                        ttl: logs_ttl(),
-                        params: ocpp_log_cache_params(limit, error_only),
-                    },
-                    move |client| {
-                        Box::pin(async move {
-                            client
-                                .list_ocpp_logs_paginated(limit, error_only)
-                                .await
-                                .map_err(AppError::from)
-                        })
-                    },
-                )
-                .await?,
-            ))
+            let plan = ocpp_log_query_plan(limit, error_only, Utc::now());
+            let spec = CacheSpec {
+                resource: "logs",
+                ttl: logs_ttl(),
+                params: ocpp_log_cache_params(limit, error_only),
+            };
+            let mut lookup = cache_lookup(cli, store)?;
+            cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
+
+            let mut cached_logs = match cache.get(&lookup, &spec) {
+                Ok(cached) => cached,
+                Err(err) => {
+                    cache_warn(cli, cache, &err);
+                    None
+                }
+            };
+            let needs_refresh = match (
+                lookup.user_email.as_deref(),
+                lookup.profile.as_deref(),
+                cached_logs.as_ref(),
+            ) {
+                (Some(_), Some(_), Some(_)) => plan.windows.iter().any(|window| {
+                    !matches!(
+                        cache.get_sync_window(
+                            "logs",
+                            &window.scope,
+                            Some(&window.day_start.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                            Some(&window.day_end.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                        ),
+                        Ok(Some(record)) if record.is_fresh_at(current_epoch_ms(), logs_ttl())
+                    )
+                }),
+                _ => true,
+            };
+
+            if needs_refresh {
+                let mut authed = resolve_authenticated_client(cli, store).await?;
+                match authed
+                    .client
+                    .sync_ocpp_logs_window(limit, error_only)
+                    .await
+                {
+                    Ok(data) => {
+                        persist_session_if_needed(store, cli, &authed)?;
+
+                        if let Some(access) = authed.client.access_context() {
+                            lookup = CacheLookup {
+                                base_url: canonical_base_url(&cli.base_url),
+                                user_email: Some(access.user_email.clone()),
+                                profile: Some(access.profile.clone()),
+                            };
+                            if let Err(err) = cache.put(&lookup, &spec, &data) {
+                                cache_warn(cli, cache, &err);
+                            }
+                            for window in &plan.windows {
+                                let window_start =
+                                    window.day_start.to_rfc3339_opts(SecondsFormat::Secs, true);
+                                let window_end =
+                                    window.day_end.to_rfc3339_opts(SecondsFormat::Secs, true);
+                                if let Err(err) = cache.record_sync_success(
+                                    "logs",
+                                    &window.scope,
+                                    Some(&window_start),
+                                    Some(&window_end),
+                                    current_epoch_ms(),
+                                ) {
+                                    cache_warn(cli, cache, &err);
+                                }
+                            }
+                        }
+
+                        cached_logs = Some(data);
+                    }
+                    Err(err) => {
+                        if authed.client.access_context().is_some() {
+                            for window in &plan.windows {
+                                let window_start =
+                                    window.day_start.to_rfc3339_opts(SecondsFormat::Secs, true);
+                                let window_end =
+                                    window.day_end.to_rfc3339_opts(SecondsFormat::Secs, true);
+                                let error_json =
+                                    serde_json::json!({ "message": err.to_string() }).to_string();
+                                if let e @ Err(_) = cache.record_sync_failure(
+                                    "logs",
+                                    &window.scope,
+                                    Some(&window_start),
+                                    Some(&window_end),
+                                    current_epoch_ms(),
+                                    &error_json,
+                                ) {
+                                    cache_warn(cli, cache, &e.unwrap_err());
+                                }
+                            }
+                        }
+
+                        if let Some(cached) = cached_logs {
+                            return Ok(Output::Logs(cached));
+                        }
+                        return Err(AppError::from(err));
+                    }
+                }
+            }
+
+            Ok(Output::Logs(cached_logs.unwrap_or_default()))
         }
         LogCommand::Ocpi { limit } => {
             let limit = *limit;
