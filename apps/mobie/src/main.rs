@@ -18,6 +18,46 @@ use session_store::{KeyringSessionStore, SessionStore, StoredSession};
 use thiserror::Error;
 
 const ORDERING_CACHE_VERSION: &str = "oldest-first-v1";
+const SESSION_RECENT_LOOKBACK_DAYS: i64 = 3;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionQueryOrder {
+    OldestFirst,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionLocalQuery {
+    location_id: String,
+    limit: i64,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    order: SessionQueryOrder,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRefreshStrategy {
+    RollingRecent,
+    ExplicitRange,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRefreshWindow {
+    window_start: String,
+    window_end: String,
+    strategy: SessionRefreshStrategy,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionQueryPlan {
+    scope: String,
+    query: SessionLocalQuery,
+    refresh: SessionRefreshWindow,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "mobie", version)]
@@ -939,6 +979,47 @@ fn session_cache_params(
             filters.date_to.clone().unwrap_or_else(|| "-".to_string()),
         ),
     ]
+}
+
+#[allow(dead_code)]
+fn session_sync_scope(location: &str) -> String {
+    format!("location:{location}")
+}
+
+#[allow(dead_code)]
+fn session_query_plan(
+    location: &str,
+    limit: i64,
+    filters: &SessionFilters,
+    now: DateTime<Utc>,
+) -> SessionQueryPlan {
+    let window_end = filters
+        .date_to
+        .clone()
+        .unwrap_or_else(|| format_api_timestamp(now));
+    let (window_start, strategy) = match filters.date_from.clone() {
+        Some(from) => (from, SessionRefreshStrategy::ExplicitRange),
+        None => (
+            format_api_timestamp(now - Duration::days(SESSION_RECENT_LOOKBACK_DAYS)),
+            SessionRefreshStrategy::RollingRecent,
+        ),
+    };
+
+    SessionQueryPlan {
+        scope: session_sync_scope(location),
+        query: SessionLocalQuery {
+            location_id: location.to_string(),
+            limit,
+            date_from: filters.date_from.clone(),
+            date_to: filters.date_to.clone(),
+            order: SessionQueryOrder::OldestFirst,
+        },
+        refresh: SessionRefreshWindow {
+            window_start,
+            window_end,
+            strategy,
+        },
+    }
 }
 
 fn ocpp_log_cache_params(limit: i64, error_only: bool) -> Vec<(&'static str, String)> {
@@ -2681,6 +2762,88 @@ mod tests {
         assert!(params.iter().any(|(key, value)| {
             *key == "order" && value == ORDERING_CACHE_VERSION
         }));
+    }
+
+    #[test]
+    fn session_query_plan_without_date_filters_uses_recent_rolling_window() {
+        let filters = SessionFilters::default();
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 12, 0, 0).unwrap();
+
+        let plan = session_query_plan("EVSE-1", 25, &filters, now);
+
+        assert_eq!(plan.scope, "location:EVSE-1");
+        assert_eq!(
+            plan.query,
+            SessionLocalQuery {
+                location_id: "EVSE-1".into(),
+                limit: 25,
+                date_from: None,
+                date_to: None,
+                order: SessionQueryOrder::OldestFirst,
+            }
+        );
+        assert_eq!(
+            plan.refresh,
+            SessionRefreshWindow {
+                window_start: "2026-03-03T12:00:00.000Z".into(),
+                window_end: "2026-03-06T12:00:00.000Z".into(),
+                strategy: SessionRefreshStrategy::RollingRecent,
+            }
+        );
+    }
+
+    #[test]
+    fn session_query_plan_with_from_only_uses_explicit_range_to_now() {
+        let filters = SessionFilters {
+            date_from: Some("2026-03-01T00:00:00.000Z".into()),
+            date_to: None,
+        };
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 12, 0, 0).unwrap();
+
+        let plan = session_query_plan("EVSE-1", 50, &filters, now);
+
+        assert_eq!(plan.scope, "location:EVSE-1");
+        assert_eq!(plan.query.date_from.as_deref(), Some("2026-03-01T00:00:00.000Z"));
+        assert_eq!(plan.query.date_to, None);
+        assert_eq!(
+            plan.refresh,
+            SessionRefreshWindow {
+                window_start: "2026-03-01T00:00:00.000Z".into(),
+                window_end: "2026-03-06T12:00:00.000Z".into(),
+                strategy: SessionRefreshStrategy::ExplicitRange,
+            }
+        );
+    }
+
+    #[test]
+    fn session_query_plan_with_explicit_range_preserves_bounds() {
+        let filters = SessionFilters {
+            date_from: Some("2026-03-01T00:00:00.000Z".into()),
+            date_to: Some("2026-03-04T00:00:00.000Z".into()),
+        };
+        let now = Utc.with_ymd_and_hms(2026, 3, 6, 12, 0, 0).unwrap();
+
+        let plan = session_query_plan("EVSE-1", 10, &filters, now);
+
+        assert_eq!(plan.scope, "location:EVSE-1");
+        assert_eq!(
+            plan.query,
+            SessionLocalQuery {
+                location_id: "EVSE-1".into(),
+                limit: 10,
+                date_from: Some("2026-03-01T00:00:00.000Z".into()),
+                date_to: Some("2026-03-04T00:00:00.000Z".into()),
+                order: SessionQueryOrder::OldestFirst,
+            }
+        );
+        assert_eq!(
+            plan.refresh,
+            SessionRefreshWindow {
+                window_start: "2026-03-01T00:00:00.000Z".into(),
+                window_end: "2026-03-04T00:00:00.000Z".into(),
+                strategy: SessionRefreshStrategy::ExplicitRange,
+            }
+        );
     }
 
     #[test]
