@@ -911,7 +911,7 @@ fn sync_ocpp_logs(
                 message_type = excluded.message_type,
                 direction = excluded.direction,
                 fingerprint = excluded.fingerprint,
-                sort_key = excluded.sort_key",
+                sort_key = min(ocpp_logs.sort_key, excluded.sort_key)",
             params![
                 base_url,
                 user_email,
