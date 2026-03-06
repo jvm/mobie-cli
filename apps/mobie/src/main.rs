@@ -1,12 +1,17 @@
+mod cache;
 mod session_store;
 
 use std::io::{self, Write};
+use std::pin::Pin;
 use std::process::ExitCode;
+use std::time::Duration as StdDuration;
 
+use cache::{CacheHandle, CacheLookup, CacheSpec};
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, SessionFilters};
 use mobie_models::{LocationDetail, LocationSummary, OcppLogEntry, Session, TokenInfo};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use session_store::{KeyringSessionStore, SessionStore, StoredSession};
@@ -292,6 +297,7 @@ impl AuthResponse {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let store = KeyringSessionStore;
+    let mut cache = CacheHandle::new();
 
     if password_supplied_via_argv() {
         render_error(
@@ -307,7 +313,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match execute_with_store(&cli, &store).await {
+    match execute_with_store(&cli, &store, &mut cache).await {
         Ok(output) => match render_output(&cli, &output) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -331,7 +337,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn execute_with_store<S: SessionStore>(cli: &Cli, store: &S) -> Result<Output, AppError> {
+async fn execute_with_store<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+) -> Result<Output, AppError> {
     match &cli.command {
         Command::Auth { command } => execute_auth_command(cli, command, store).await,
         Command::Entities { command } => {
@@ -347,10 +357,7 @@ async fn execute_with_store<S: SessionStore>(cli: &Cli, store: &S) -> Result<Out
             Ok(output)
         }
         Command::Locations { command } => {
-            let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_location_command(&mut authed.client, command).await?;
-            persist_session_if_needed(store, cli, &authed)?;
-            Ok(output)
+            execute_cached_location_command(cli, store, cache, command).await
         }
         Command::Ords { command } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
@@ -359,22 +366,13 @@ async fn execute_with_store<S: SessionStore>(cli: &Cli, store: &S) -> Result<Out
             Ok(output)
         }
         Command::Sessions { command } => {
-            let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_session_command(&mut authed.client, command).await?;
-            persist_session_if_needed(store, cli, &authed)?;
-            Ok(output)
+            execute_cached_session_command(cli, store, cache, command).await
         }
         Command::Tokens { command } => {
-            let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_token_command(&mut authed.client, command).await?;
-            persist_session_if_needed(store, cli, &authed)?;
-            Ok(output)
+            execute_cached_token_command(cli, store, cache, command).await
         }
         Command::Logs { command } => {
-            let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_log_command(&mut authed.client, command).await?;
-            persist_session_if_needed(store, cli, &authed)?;
-            Ok(output)
+            execute_cached_log_command(cli, store, cache, command).await
         }
     }
 }
@@ -441,24 +439,273 @@ async fn execute_auth_command<S: SessionStore>(
     }
 }
 
-async fn execute_location_command(
-    client: &mut MobieClient,
+async fn execute_cached_location_command<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
     command: &LocationCommand,
 ) -> Result<Output, AppError> {
     match command {
-        LocationCommand::List => Ok(Output::Locations(client.list_locations().await?)),
+        LocationCommand::List => Ok(Output::Locations(
+            cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "locations",
+                    ttl: location_list_ttl(),
+                    params: vec![("limit", "0".to_string()), ("offset", "0".to_string())],
+                },
+                |client| Box::pin(async move { client.list_locations().await.map_err(AppError::from) }),
+            )
+            .await?,
+        )),
         LocationCommand::Get { location } => {
-            Ok(Output::Location(client.get_location(location).await?))
+            let location = location.clone();
+            Ok(Output::Location(cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "location",
+                    ttl: location_detail_ttl(),
+                    params: vec![("location", location.clone())],
+                },
+                move |client| {
+                    Box::pin(async move { client.get_location(&location).await.map_err(AppError::from) })
+                },
+            )
+            .await?))
         }
         LocationCommand::Analytics => Ok(Output::JsonObject(
             "location_analytics",
-            client.get_location_analytics().await?,
+            cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "location_analytics",
+                    ttl: location_analytics_ttl(),
+                    params: Vec::new(),
+                },
+                |client| Box::pin(async move { client.get_location_analytics().await.map_err(AppError::from) }),
+            )
+            .await?,
         )),
         LocationCommand::Geojson => Ok(Output::JsonObject(
             "location_geojson",
-            client.get_location_geojson().await?,
+            cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "location_geojson",
+                    ttl: location_geojson_ttl(),
+                    params: Vec::new(),
+                },
+                |client| Box::pin(async move { client.get_location_geojson().await.map_err(AppError::from) }),
+            )
+            .await?,
         )),
     }
+}
+
+async fn execute_cached_session_command<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+    command: &SessionCommand,
+) -> Result<Output, AppError> {
+    match command {
+        SessionCommand::List {
+            location,
+            limit,
+            from,
+            to,
+        } => {
+            let location = location.clone();
+            let limit = *limit;
+            let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
+            Ok(Output::Sessions(
+                cached_fetch(
+                    cli,
+                    store,
+                    cache,
+                    CacheSpec {
+                        resource: "sessions",
+                        ttl: sessions_ttl(),
+                        params: vec![
+                            ("location", location.clone()),
+                            ("limit", limit.to_string()),
+                            (
+                                "from",
+                                filters.date_from.clone().unwrap_or_else(|| "-".to_string()),
+                            ),
+                            ("to", filters.date_to.clone().unwrap_or_else(|| "-".to_string())),
+                        ],
+                    },
+                    move |client| Box::pin(async move {
+                        client
+                            .list_sessions_paginated_filtered(&location, limit, &filters)
+                            .await
+                            .map_err(AppError::from)
+                    }),
+                )
+                .await?,
+            ))
+        }
+    }
+}
+
+async fn execute_cached_token_command<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+    command: &TokenCommand,
+) -> Result<Output, AppError> {
+    match command {
+        TokenCommand::List { limit } => {
+            let limit = *limit;
+            Ok(Output::Tokens(cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "tokens",
+                    ttl: tokens_ttl(),
+                    params: vec![("limit", limit.to_string())],
+                },
+                move |client| {
+                    Box::pin(async move { client.list_tokens_paginated(limit).await.map_err(AppError::from) })
+                },
+            )
+            .await?))
+        }
+    }
+}
+
+async fn execute_cached_log_command<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+    command: &LogCommand,
+) -> Result<Output, AppError> {
+    match command {
+        LogCommand::List { limit, error_only } => {
+            let limit = *limit;
+            let error_only = *error_only;
+            Ok(Output::Logs(cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "logs",
+                    ttl: logs_ttl(),
+                    params: vec![
+                        ("limit", limit.to_string()),
+                        ("error_only", error_only.to_string()),
+                    ],
+                },
+                move |client| Box::pin(async move {
+                    client
+                        .list_ocpp_logs_paginated(limit, error_only)
+                        .await
+                        .map_err(AppError::from)
+                }),
+            )
+            .await?))
+        }
+        LogCommand::Ocpi { limit } => {
+            let limit = *limit;
+            Ok(Output::JsonArray(
+                "ocpi_logs",
+                cached_fetch(
+                cli,
+                store,
+                cache,
+                CacheSpec {
+                    resource: "ocpi_logs",
+                    ttl: logs_ttl(),
+                    params: vec![("limit", limit.to_string())],
+                },
+                move |client| {
+                    Box::pin(async move { client.list_ocpi_logs_paginated(limit).await.map_err(AppError::from) })
+                },
+            )
+                .await?,
+            ))
+        }
+    }
+}
+
+async fn cached_fetch<S, T, F>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+    spec: CacheSpec,
+    fetch: F,
+) -> Result<T, AppError>
+where
+    S: SessionStore,
+    T: Serialize + DeserializeOwned,
+    F: for<'a> FnOnce(&'a mut MobieClient) -> Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + 'a>>,
+{
+    let lookup = cache_lookup(cli, store)?;
+    cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
+    match cache.get(&lookup, &spec) {
+        Ok(Some(cached)) => return Ok(cached),
+        Ok(None) => {}
+        Err(err) => cache_warn(cli, cache, &err),
+    }
+
+    let mut authed = resolve_authenticated_client(cli, store).await?;
+    let data = fetch(&mut authed.client).await?;
+    persist_session_if_needed(store, cli, &authed)?;
+
+    if let Some(access) = authed.client.access_context() {
+        let populated_lookup = CacheLookup {
+            base_url: canonical_base_url(&cli.base_url),
+            user_email: Some(access.user_email.clone()),
+            profile: Some(access.profile.clone()),
+        };
+        if let Err(err) = cache.put(&populated_lookup, &spec, &data) {
+            cache_warn(cli, cache, &err);
+        }
+    }
+
+    Ok(data)
+}
+
+fn cache_lookup<S: SessionStore>(cli: &Cli, store: &S) -> Result<CacheLookup, AppError> {
+    let canonical_base_url = canonical_base_url(&cli.base_url);
+    let explicit_email = cli
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    let stored_session = store.load(&cli.base_url).map_err(AppError::SecretStore)?;
+    let matching_stored_session = stored_session.filter(|session| {
+        explicit_email
+            .as_deref()
+            .map(|email| email.eq_ignore_ascii_case(&session.access.user_email))
+            .unwrap_or(true)
+    });
+
+    Ok(CacheLookup {
+        base_url: canonical_base_url,
+        user_email: explicit_email
+            .or_else(|| matching_stored_session.as_ref().map(|session| session.access.user_email.clone())),
+        profile: matching_stored_session.map(|session| session.access.profile),
+    })
+}
+
+fn cache_warn(cli: &Cli, cache: &mut CacheHandle, error: &str) {
+    if !cli.json && !cli.markdown && !cli.toon {
+        eprintln!("warning: cache unavailable: {error}");
+    }
+    cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 }
 
 async fn execute_entity_command(
@@ -496,53 +743,6 @@ async fn execute_ord_command(
         OrdCommand::CpesToIntegrate => Ok(Output::JsonArray(
             "ords_cpes_to_integrate",
             client.list_ords_cpes_to_integrate().await?,
-        )),
-    }
-}
-
-async fn execute_session_command(
-    client: &mut MobieClient,
-    command: &SessionCommand,
-) -> Result<Output, AppError> {
-    match command {
-        SessionCommand::List {
-            location,
-            limit,
-            from,
-            to,
-        } => {
-            let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
-            Ok(Output::Sessions(
-                client
-                    .list_sessions_paginated_filtered(location, *limit, &filters)
-                    .await?,
-            ))
-        }
-    }
-}
-
-async fn execute_token_command(
-    client: &mut MobieClient,
-    command: &TokenCommand,
-) -> Result<Output, AppError> {
-    match command {
-        TokenCommand::List { limit } => {
-            Ok(Output::Tokens(client.list_tokens_paginated(*limit).await?))
-        }
-    }
-}
-
-async fn execute_log_command(
-    client: &mut MobieClient,
-    command: &LogCommand,
-) -> Result<Output, AppError> {
-    match command {
-        LogCommand::List { limit, error_only } => Ok(Output::Logs(
-            client.list_ocpp_logs_paginated(*limit, *error_only).await?,
-        )),
-        LogCommand::Ocpi { limit } => Ok(Output::JsonArray(
-            "ocpi_logs",
-            client.list_ocpi_logs_paginated(*limit).await?,
         )),
     }
 }
@@ -605,6 +805,34 @@ fn canonical_base_url(base_url: &str) -> String {
     } else {
         canonical.to_string()
     }
+}
+
+fn location_list_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 60 * 24)
+}
+
+fn location_detail_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 60 * 24)
+}
+
+fn location_analytics_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 60 * 6)
+}
+
+fn location_geojson_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 60 * 6)
+}
+
+fn sessions_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 15)
+}
+
+fn tokens_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 15)
+}
+
+fn logs_ttl() -> StdDuration {
+    StdDuration::from_secs(60 * 15)
 }
 
 async fn login_with_cli_credentials(
@@ -2098,6 +2326,7 @@ mod tests {
             "token-1",
             Some("refresh-1"),
         ));
+        let mut cache = CacheHandle::new();
 
         let output = execute_with_store(
             &cli(
@@ -2107,6 +2336,7 @@ mod tests {
                 },
             ),
             &store,
+            &mut cache,
         )
         .await
         .unwrap();
@@ -2129,6 +2359,7 @@ mod tests {
             "token-1",
             Some("refresh-1"),
         ));
+        let mut cache = CacheHandle::new();
 
         let output = execute_with_store(
             &cli(
@@ -2138,6 +2369,7 @@ mod tests {
                 },
             ),
             &store,
+            &mut cache,
         )
         .await
         .unwrap();
@@ -2157,6 +2389,7 @@ mod tests {
             "stored-token",
             Some("refresh-1"),
         ));
+        let mut cache = CacheHandle::new();
 
         Mock::given(method("POST"))
             .and(path("/api/login"))
@@ -2190,6 +2423,7 @@ mod tests {
                 },
             },
             &store,
+            &mut cache,
         )
         .await
         .unwrap();
@@ -2220,6 +2454,7 @@ mod tests {
                 expires_at_epoch_ms: Some(now_ms - 1_000),
             },
         });
+        let mut cache = CacheHandle::new();
 
         Mock::given(method("POST"))
             .and(path("/api/refresh"))
@@ -2258,6 +2493,7 @@ mod tests {
                 },
             ),
             &store,
+            &mut cache,
         )
         .await
         .unwrap();
