@@ -11,8 +11,8 @@ use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, SessionFilters};
 use mobie_models::{LocationDetail, LocationSummary, OcppLogEntry, Session, TokenInfo};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use session_store::{KeyringSessionStore, SessionStore, StoredSession};
 use thiserror::Error;
@@ -371,9 +371,7 @@ async fn execute_with_store<S: SessionStore>(
         Command::Tokens { command } => {
             execute_cached_token_command(cli, store, cache, command).await
         }
-        Command::Logs { command } => {
-            execute_cached_log_command(cli, store, cache, command).await
-        }
+        Command::Logs { command } => execute_cached_log_command(cli, store, cache, command).await,
     }
 }
 
@@ -456,26 +454,32 @@ async fn execute_cached_location_command<S: SessionStore>(
                     ttl: location_list_ttl(),
                     params: vec![("limit", "0".to_string()), ("offset", "0".to_string())],
                 },
-                |client| Box::pin(async move { client.list_locations().await.map_err(AppError::from) }),
+                |client| {
+                    Box::pin(async move { client.list_locations().await.map_err(AppError::from) })
+                },
             )
             .await?,
         )),
         LocationCommand::Get { location } => {
             let location = location.clone();
-            Ok(Output::Location(cached_fetch(
-                cli,
-                store,
-                cache,
-                CacheSpec {
-                    resource: "location",
-                    ttl: location_detail_ttl(),
-                    params: vec![("location", location.clone())],
-                },
-                move |client| {
-                    Box::pin(async move { client.get_location(&location).await.map_err(AppError::from) })
-                },
-            )
-            .await?))
+            Ok(Output::Location(
+                cached_fetch(
+                    cli,
+                    store,
+                    cache,
+                    CacheSpec {
+                        resource: "location",
+                        ttl: location_detail_ttl(),
+                        params: vec![("location", location.clone())],
+                    },
+                    move |client| {
+                        Box::pin(async move {
+                            client.get_location(&location).await.map_err(AppError::from)
+                        })
+                    },
+                )
+                .await?,
+            ))
         }
         LocationCommand::Analytics => Ok(Output::JsonObject(
             "location_analytics",
@@ -488,7 +492,14 @@ async fn execute_cached_location_command<S: SessionStore>(
                     ttl: location_analytics_ttl(),
                     params: Vec::new(),
                 },
-                |client| Box::pin(async move { client.get_location_analytics().await.map_err(AppError::from) }),
+                |client| {
+                    Box::pin(async move {
+                        client
+                            .get_location_analytics()
+                            .await
+                            .map_err(AppError::from)
+                    })
+                },
             )
             .await?,
         )),
@@ -503,7 +514,11 @@ async fn execute_cached_location_command<S: SessionStore>(
                     ttl: location_geojson_ttl(),
                     params: Vec::new(),
                 },
-                |client| Box::pin(async move { client.get_location_geojson().await.map_err(AppError::from) }),
+                |client| {
+                    Box::pin(
+                        async move { client.get_location_geojson().await.map_err(AppError::from) },
+                    )
+                },
             )
             .await?,
         )),
@@ -541,15 +556,20 @@ async fn execute_cached_session_command<S: SessionStore>(
                                 "from",
                                 filters.date_from.clone().unwrap_or_else(|| "-".to_string()),
                             ),
-                            ("to", filters.date_to.clone().unwrap_or_else(|| "-".to_string())),
+                            (
+                                "to",
+                                filters.date_to.clone().unwrap_or_else(|| "-".to_string()),
+                            ),
                         ],
                     },
-                    move |client| Box::pin(async move {
-                        client
-                            .list_sessions_paginated_filtered(&location, limit, &filters)
-                            .await
-                            .map_err(AppError::from)
-                    }),
+                    move |client| {
+                        Box::pin(async move {
+                            client
+                                .list_sessions_paginated_filtered(&location, limit, &filters)
+                                .await
+                                .map_err(AppError::from)
+                        })
+                    },
                 )
                 .await?,
             ))
@@ -566,20 +586,27 @@ async fn execute_cached_token_command<S: SessionStore>(
     match command {
         TokenCommand::List { limit } => {
             let limit = *limit;
-            Ok(Output::Tokens(cached_fetch(
-                cli,
-                store,
-                cache,
-                CacheSpec {
-                    resource: "tokens",
-                    ttl: tokens_ttl(),
-                    params: vec![("limit", limit.to_string())],
-                },
-                move |client| {
-                    Box::pin(async move { client.list_tokens_paginated(limit).await.map_err(AppError::from) })
-                },
-            )
-            .await?))
+            Ok(Output::Tokens(
+                cached_fetch(
+                    cli,
+                    store,
+                    cache,
+                    CacheSpec {
+                        resource: "tokens",
+                        ttl: tokens_ttl(),
+                        params: vec![("limit", limit.to_string())],
+                    },
+                    move |client| {
+                        Box::pin(async move {
+                            client
+                                .list_tokens_paginated(limit)
+                                .await
+                                .map_err(AppError::from)
+                        })
+                    },
+                )
+                .await?,
+            ))
         }
     }
 }
@@ -594,44 +621,53 @@ async fn execute_cached_log_command<S: SessionStore>(
         LogCommand::List { limit, error_only } => {
             let limit = *limit;
             let error_only = *error_only;
-            Ok(Output::Logs(cached_fetch(
-                cli,
-                store,
-                cache,
-                CacheSpec {
-                    resource: "logs",
-                    ttl: logs_ttl(),
-                    params: vec![
-                        ("limit", limit.to_string()),
-                        ("error_only", error_only.to_string()),
-                    ],
-                },
-                move |client| Box::pin(async move {
-                    client
-                        .list_ocpp_logs_paginated(limit, error_only)
-                        .await
-                        .map_err(AppError::from)
-                }),
-            )
-            .await?))
+            Ok(Output::Logs(
+                cached_fetch(
+                    cli,
+                    store,
+                    cache,
+                    CacheSpec {
+                        resource: "logs",
+                        ttl: logs_ttl(),
+                        params: vec![
+                            ("limit", limit.to_string()),
+                            ("error_only", error_only.to_string()),
+                        ],
+                    },
+                    move |client| {
+                        Box::pin(async move {
+                            client
+                                .list_ocpp_logs_paginated(limit, error_only)
+                                .await
+                                .map_err(AppError::from)
+                        })
+                    },
+                )
+                .await?,
+            ))
         }
         LogCommand::Ocpi { limit } => {
             let limit = *limit;
             Ok(Output::JsonArray(
                 "ocpi_logs",
                 cached_fetch(
-                cli,
-                store,
-                cache,
-                CacheSpec {
-                    resource: "ocpi_logs",
-                    ttl: logs_ttl(),
-                    params: vec![("limit", limit.to_string())],
-                },
-                move |client| {
-                    Box::pin(async move { client.list_ocpi_logs_paginated(limit).await.map_err(AppError::from) })
-                },
-            )
+                    cli,
+                    store,
+                    cache,
+                    CacheSpec {
+                        resource: "ocpi_logs",
+                        ttl: logs_ttl(),
+                        params: vec![("limit", limit.to_string())],
+                    },
+                    move |client| {
+                        Box::pin(async move {
+                            client
+                                .list_ocpi_logs_paginated(limit)
+                                .await
+                                .map_err(AppError::from)
+                        })
+                    },
+                )
                 .await?,
             ))
         }
@@ -648,7 +684,9 @@ async fn cached_fetch<S, T, F>(
 where
     S: SessionStore,
     T: Serialize + DeserializeOwned,
-    F: for<'a> FnOnce(&'a mut MobieClient) -> Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + 'a>>,
+    F: for<'a> FnOnce(
+        &'a mut MobieClient,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + 'a>>,
 {
     let lookup = cache_lookup(cli, store)?;
     cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
@@ -695,8 +733,11 @@ fn cache_lookup<S: SessionStore>(cli: &Cli, store: &S) -> Result<CacheLookup, Ap
 
     Ok(CacheLookup {
         base_url: canonical_base_url,
-        user_email: explicit_email
-            .or_else(|| matching_stored_session.as_ref().map(|session| session.access.user_email.clone())),
+        user_email: explicit_email.or_else(|| {
+            matching_stored_session
+                .as_ref()
+                .map(|session| session.access.user_email.clone())
+        }),
         profile: matching_stored_session.map(|session| session.access.profile),
     })
 }
@@ -713,7 +754,9 @@ async fn execute_entity_command(
     command: &EntityCommand,
 ) -> Result<Output, AppError> {
     match command {
-        EntityCommand::Get { code } => Ok(Output::JsonObject("entity", client.get_entity(code).await?)),
+        EntityCommand::Get { code } => {
+            Ok(Output::JsonObject("entity", client.get_entity(code).await?))
+        }
     }
 }
 
@@ -1033,7 +1076,9 @@ fn render_output(cli: &Cli, output: &Output) -> Result<(), Box<dyn std::error::E
             Output::AuthStatus(data) => write_json("auth_status", data, 1, cli.pretty)?,
             Output::AuthLogout(data) => write_json("auth_logout", data, 1, cli.pretty)?,
             Output::JsonObject(resource, data) => write_json(resource, data, 1, cli.pretty)?,
-            Output::JsonArray(resource, data) => write_json(resource, data, data.len(), cli.pretty)?,
+            Output::JsonArray(resource, data) => {
+                write_json(resource, data, data.len(), cli.pretty)?
+            }
             Output::Locations(data) => write_json("locations", data, data.len(), cli.pretty)?,
             Output::Location(data) => write_json("location", data, 1, cli.pretty)?,
             Output::Sessions(data) => write_json("sessions", data, data.len(), cli.pretty)?,
@@ -1078,7 +1123,10 @@ fn render_markdown_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                 ("stored", data.stored.to_string()),
                 ("base_url", data.base_url.clone()),
                 ("email", data.email.clone().unwrap_or_else(|| "-".into())),
-                ("profile", data.profile.clone().unwrap_or_else(|| "-".into())),
+                (
+                    "profile",
+                    data.profile.clone().unwrap_or_else(|| "-".into()),
+                ),
                 (
                     "has_refresh_token",
                     data.has_refresh_token
@@ -1208,7 +1256,10 @@ fn render_terminal_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                 ("stored", data.stored.to_string()),
                 ("base_url", data.base_url.clone()),
                 ("email", data.email.clone().unwrap_or_else(|| "-".into())),
-                ("profile", data.profile.clone().unwrap_or_else(|| "-".into())),
+                (
+                    "profile",
+                    data.profile.clone().unwrap_or_else(|| "-".into()),
+                ),
             ]);
         }
         Output::AuthLogout(data) => {
@@ -1338,7 +1389,10 @@ fn render_plain_table(headers: &[&str], rows: Vec<Vec<String>>) {
             .join("  ")
     );
     for row in rows {
-        println!("{}", format_plain_row(row.iter().map(String::as_str), &widths));
+        println!(
+            "{}",
+            format_plain_row(row.iter().map(String::as_str), &widths)
+        );
     }
 }
 
@@ -1373,7 +1427,11 @@ fn render_markdown_table(headers: &[&str], rows: Vec<Vec<String>>) {
     );
     println!(
         "| {} |",
-        headers.iter().map(|_| "---".to_string()).collect::<Vec<_>>().join(" | ")
+        headers
+            .iter()
+            .map(|_| "---".to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
     for row in rows {
         println!(
@@ -1674,7 +1732,10 @@ fn render_generic_json_array(values: &[Value]) {
     }
 
     println!("```json");
-    println!("{}", serde_json::to_string_pretty(values).unwrap_or_else(|_| "[]".into()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(values).unwrap_or_else(|_| "[]".into())
+    );
     println!("```");
 }
 
@@ -1696,14 +1757,19 @@ fn render_terminal_generic_json_array(values: &[Value]) {
         }
     }
 
-    println!("{}", serde_json::to_string_pretty(values).unwrap_or_else(|_| "[]".into()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(values).unwrap_or_else(|_| "[]".into())
+    );
 }
 
 fn render_generic_json_object(value: &Value) {
     if let Some(obj) = value.as_object() {
         let scalar_rows = obj
             .iter()
-            .filter_map(|(key, val)| is_scalar(val).then_some((key.as_str(), json_scalar_to_string(val))))
+            .filter_map(|(key, val)| {
+                is_scalar(val).then_some((key.as_str(), json_scalar_to_string(val)))
+            })
             .collect::<Vec<_>>();
         if !scalar_rows.is_empty() {
             render_markdown_key_values(&scalar_rows);
@@ -1735,7 +1801,10 @@ fn render_generic_json_object(value: &Value) {
                         })
                         .collect::<Vec<_>>();
                     if nested_rows.is_empty() {
-                        println!("- keys: {}", map.keys().cloned().collect::<Vec<_>>().join(", "));
+                        println!(
+                            "- keys: {}",
+                            map.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
                     } else {
                         render_markdown_key_values(&nested_rows);
                     }
@@ -1745,7 +1814,10 @@ fn render_generic_json_object(value: &Value) {
         }
     } else {
         println!("```json");
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into())
+        );
         println!("```");
     }
 }
@@ -1788,7 +1860,10 @@ fn render_terminal_generic_json_object(value: &Value) {
                         })
                         .collect::<Vec<_>>();
                     if nested_rows.is_empty() {
-                        println!("keys   {}", map.keys().cloned().collect::<Vec<_>>().join(", "));
+                        println!(
+                            "keys   {}",
+                            map.keys().cloned().collect::<Vec<_>>().join(", ")
+                        );
                     } else {
                         render_plain_key_values(&nested_rows);
                     }
@@ -1797,12 +1872,16 @@ fn render_terminal_generic_json_object(value: &Value) {
             }
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".into())
+        );
     }
 }
 
 fn collect_scalar_columns<'a>(items: &'a [Value], limit: usize) -> Vec<&'a str> {
-    items.first()
+    items
+        .first()
         .and_then(Value::as_object)
         .map(|first_obj| {
             first_obj
@@ -1815,7 +1894,8 @@ fn collect_scalar_columns<'a>(items: &'a [Value], limit: usize) -> Vec<&'a str> 
 }
 
 fn lookup_json_value(value: &Value, key: &str) -> String {
-    value.as_object()
+    value
+        .as_object()
         .and_then(|obj| obj.get(key))
         .map(json_scalar_to_string)
         .unwrap_or_else(|| "-".into())
@@ -1869,10 +1949,7 @@ fn write_json<T: Serialize>(
     Ok(())
 }
 
-fn render_toon_output(
-    output: &Output,
-    _pretty: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn render_toon_output(output: &Output, _pretty: bool) -> Result<(), Box<dyn std::error::Error>> {
     match output {
         Output::Auth(data) => write_toon("auth", data, 1)?,
         Output::AuthStatus(data) => write_toon("auth_status", data, 1)?,
@@ -1923,7 +2000,11 @@ fn encode_toon_document(value: &Value) -> String {
     }
 }
 
-fn encode_toon_object_fields(map: &serde_json::Map<String, Value>, indent: usize, lines: &mut Vec<String>) {
+fn encode_toon_object_fields(
+    map: &serde_json::Map<String, Value>,
+    indent: usize,
+    lines: &mut Vec<String>,
+) {
     for (key, value) in map {
         encode_toon_field(key, value, indent, lines);
     }
@@ -1968,7 +2049,10 @@ fn encode_toon_field(key: &str, value: &Value, indent: usize, lines: &mut Vec<St
                 encode_toon_array_body(items, indent + 1, lines);
             }
         }
-        _ => lines.push(format!("{prefix}{key}: {}", encode_toon_scalar(value, false))),
+        _ => lines.push(format!(
+            "{prefix}{key}: {}",
+            encode_toon_scalar(value, false)
+        )),
     }
 }
 
@@ -2089,11 +2173,7 @@ fn encode_toon_string(value: &str, in_row: bool) -> String {
     }
 
     let needs_quotes = value.chars().any(|c| {
-        c == '\n'
-            || c == '\r'
-            || c == '"'
-            || (in_row && c == ',')
-            || (!in_row && c == '#')
+        c == '\n' || c == '\r' || c == '"' || (in_row && c == ',') || (!in_row && c == '#')
     }) || value.starts_with(' ')
         || value.ends_with(' ')
         || value == "null"

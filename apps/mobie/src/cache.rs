@@ -76,7 +76,12 @@ impl CacheHandle {
         store.get(lookup, spec)
     }
 
-    pub fn put<T>(&mut self, lookup: &CacheLookup, spec: &CacheSpec, value: &T) -> Result<(), String>
+    pub fn put<T>(
+        &mut self,
+        lookup: &CacheLookup,
+        spec: &CacheSpec,
+        value: &T,
+    ) -> Result<(), String>
     where
         T: Serialize,
     {
@@ -112,8 +117,12 @@ impl CacheStore {
         let parent = path
             .parent()
             .ok_or_else(|| format!("invalid cache database path: {}", path.display()))?;
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create cache directory {}: {err}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create cache directory {}: {err}",
+                parent.display()
+            )
+        })?;
 
         let conn = Connection::open(&path)
             .map_err(|err| format!("failed to open cache database {}: {err}", path.display()))?;
@@ -300,10 +309,10 @@ impl CacheStore {
         let params_map = normalize_params(&spec.params);
         let scope = scope_string(&lookup.base_url, user_email, spec.resource, &params_map)?;
         let key = key_string(&scope, profile)?;
-        let payload_json =
-            serde_json::to_string(value).map_err(|err| format!("failed to serialize cache payload: {err}"))?;
-        let payload_value: Value =
-            serde_json::from_str(&payload_json).map_err(|err| format!("failed to reparse cache payload: {err}"))?;
+        let payload_json = serde_json::to_string(value)
+            .map_err(|err| format!("failed to serialize cache payload: {err}"))?;
+        let payload_value: Value = serde_json::from_str(&payload_json)
+            .map_err(|err| format!("failed to reparse cache payload: {err}"))?;
         let fetched_at_epoch_ms = now_epoch_ms();
         let ttl_ms = i64::try_from(spec.ttl.as_millis()).unwrap_or(i64::MAX);
         let expires_at_epoch_ms = fetched_at_epoch_ms.saturating_add(ttl_ms);
@@ -313,7 +322,7 @@ impl CacheStore {
             .map_err(|err| format!("failed to start cache transaction: {err}"))?;
 
         tx.execute(
-                "INSERT INTO cache_entries (
+            "INSERT INTO cache_entries (
                     key, resource, scope, payload_json, fetched_at, expires_at, etag_or_version
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
                  ON CONFLICT(key) DO UPDATE SET
@@ -323,16 +332,16 @@ impl CacheStore {
                     fetched_at = excluded.fetched_at,
                     expires_at = excluded.expires_at,
                     etag_or_version = excluded.etag_or_version",
-                params![
-                    key,
-                    spec.resource,
-                    scope,
-                    payload_json,
-                    fetched_at_epoch_ms,
-                    expires_at_epoch_ms
-                ],
-            )
-            .map_err(|err| format!("failed to write cache entry: {err}"))?;
+            params![
+                key,
+                spec.resource,
+                scope,
+                payload_json,
+                fetched_at_epoch_ms,
+                expires_at_epoch_ms
+            ],
+        )
+        .map_err(|err| format!("failed to write cache entry: {err}"))?;
         sync_domain_tables(
             &tx,
             lookup,
@@ -510,8 +519,8 @@ fn upsert_location(
     let status = item.get("status").and_then(json_scalar_to_string);
     let speed = item.get("speed").and_then(json_scalar_to_string);
     let state = item.get("state").and_then(json_scalar_to_string);
-    let payload_json =
-        serde_json::to_string(item).map_err(|err| format!("failed to serialize location row: {err}"))?;
+    let payload_json = serde_json::to_string(item)
+        .map_err(|err| format!("failed to serialize location row: {err}"))?;
 
     tx.execute(
         "INSERT INTO locations (
@@ -569,8 +578,8 @@ fn sync_sessions(
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| "session entry missing id".to_string())?;
-        let payload_json =
-            serde_json::to_string(item).map_err(|err| format!("failed to serialize session row: {err}"))?;
+        let payload_json = serde_json::to_string(item)
+            .map_err(|err| format!("failed to serialize session row: {err}"))?;
         let token_uid = item
             .get("cdr_token")
             .and_then(|token| token.get("uid"))
@@ -640,8 +649,8 @@ fn sync_tokens(
         let token_key = token_uid
             .clone()
             .unwrap_or_else(|| format!("scope:{scope}:index:{index}"));
-        let payload_json =
-            serde_json::to_string(item).map_err(|err| format!("failed to serialize token row: {err}"))?;
+        let payload_json = serde_json::to_string(item)
+            .map_err(|err| format!("failed to serialize token row: {err}"))?;
 
         tx.execute(
             "INSERT INTO tokens (
@@ -694,8 +703,8 @@ fn sync_ocpp_logs(
             .or_else(|| timestamp.clone())
             .map(|base| format!("{base}:{index}"))
             .unwrap_or_else(|| format!("scope:{scope}:index:{index}"));
-        let payload_json =
-            serde_json::to_string(item).map_err(|err| format!("failed to serialize log row: {err}"))?;
+        let payload_json = serde_json::to_string(item)
+            .map_err(|err| format!("failed to serialize log row: {err}"))?;
 
         tx.execute(
             "INSERT INTO ocpp_logs (
@@ -742,8 +751,8 @@ fn sync_json_resource(
     fetched_at_epoch_ms: i64,
     expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
-    let payload_json =
-        serde_json::to_string(payload).map_err(|err| format!("failed to serialize json resource row: {err}"))?;
+    let payload_json = serde_json::to_string(payload)
+        .map_err(|err| format!("failed to serialize json resource row: {err}"))?;
     tx.execute(
         "INSERT INTO json_resources (
             base_url, user_email, profile, resource, scope, payload_json, fetched_at, expires_at
@@ -855,7 +864,8 @@ mod tests {
 
     #[test]
     fn cache_path_defaults_to_mobie_cache_db() {
-        let path = default_cache_db_path_with_env(None, || Some(PathBuf::from("/tmp/mobie"))).unwrap();
+        let path =
+            default_cache_db_path_with_env(None, || Some(PathBuf::from("/tmp/mobie"))).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/mobie/cache.db"));
     }
 
@@ -971,7 +981,14 @@ mod tests {
                 "INSERT INTO cache_entries (
                     key, resource, scope, payload_json, fetched_at, expires_at, etag_or_version
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-                params![key.clone(), spec.resource, scope, "{invalid", 10_i64, 20_i64],
+                params![
+                    key.clone(),
+                    spec.resource,
+                    scope,
+                    "{invalid",
+                    10_i64,
+                    20_i64
+                ],
             )
             .unwrap();
 
@@ -1045,9 +1062,11 @@ mod tests {
             .unwrap();
         let token_uid: String = store
             .conn
-            .query_row("SELECT token_uid FROM sessions WHERE session_id = 'sess-1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT token_uid FROM sessions WHERE session_id = 'sess-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         assert_eq!(locations, 1);

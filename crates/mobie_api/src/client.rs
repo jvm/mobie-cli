@@ -5,9 +5,9 @@ use mobie_models::{
 };
 use reqwest::Url;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde_json::Value;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tracing::{debug, error, info, instrument};
 
 use crate::{MobieApiError, sanitize_error_body};
@@ -432,7 +432,10 @@ impl MobieClient {
         .await
     }
 
-    pub async fn list_ocpi_logs_paginated(&mut self, limit: i64) -> Result<Vec<Value>, MobieApiError> {
+    pub async fn list_ocpi_logs_paginated(
+        &mut self,
+        limit: i64,
+    ) -> Result<Vec<Value>, MobieApiError> {
         self.collect_paginated(limit, |client, page_limit, offset| {
             Box::pin(client.list_ocpi_logs_page(page_limit, offset))
         })
@@ -483,7 +486,10 @@ impl MobieClient {
     }
 
     pub async fn get_ord_statistics(&mut self) -> Result<Value, MobieApiError> {
-        let url = format!("{}/api/ords/statistics", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/ords/statistics",
+            self.base_url.trim_end_matches('/')
+        );
         let headers = self.authed_headers().await?;
         let env: ApiEnvelope<Value> = self.get_json(&url, headers).await?;
         Ok(env.data)
