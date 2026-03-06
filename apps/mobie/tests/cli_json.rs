@@ -1,6 +1,7 @@
 use assert_cmd::assert::OutputAssertExt;
 use serde_json::Value;
 use std::process::Command;
+use tempfile::tempdir;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -35,12 +36,19 @@ async fn mock_login(server: &MockServer) {
         .await;
 }
 
+fn mobie_command() -> Command {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("mobie"));
+    let cache_dir = tempdir().unwrap().keep();
+    cmd.env("MOBIE_CACHE_DIR", cache_dir);
+    cmd
+}
+
 #[tokio::test]
 async fn auth_check_json_returns_safe_fields_only() {
     let server = MockServer::start().await;
     mock_login(&server).await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -67,7 +75,7 @@ async fn auth_check_json_returns_safe_fields_only() {
 
 #[test]
 fn rejects_insecure_non_loopback_base_url() {
-    let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let assert = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -114,7 +122,7 @@ async fn locations_list_json_returns_envelope_and_count() {
         .mount(&server)
         .await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -151,7 +159,7 @@ async fn json_errors_are_structured_and_sanitized() {
         .mount(&server)
         .await;
 
-    let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let assert = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -179,7 +187,7 @@ async fn invalid_session_range_is_reported_as_structured_json() {
     let server = MockServer::start().await;
     mock_login(&server).await;
 
-    let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let assert = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -231,7 +239,7 @@ async fn entity_get_json_returns_single_object() {
         .mount(&server)
         .await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -275,7 +283,7 @@ async fn location_analytics_json_returns_object() {
         .mount(&server)
         .await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -315,7 +323,7 @@ async fn ords_list_json_returns_array() {
         .mount(&server)
         .await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -371,7 +379,7 @@ async fn logs_ocpi_json_returns_array() {
         .mount(&server)
         .await;
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let output = mobie_command()
         .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
@@ -398,7 +406,7 @@ async fn logs_ocpi_json_returns_array() {
 
 #[test]
 fn rejects_password_passed_on_argv() {
-    let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+    let assert = mobie_command()
         .args([
             "--base-url",
             "https://pgm.mobie.pt",

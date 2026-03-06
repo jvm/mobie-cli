@@ -484,3 +484,117 @@ async fn response_cache_policy_keeps_sessions_and_logs_canonical_state_after_sna
     assert_eq!(log_rows, 1);
     assert_eq!(sync_window_rows, 2);
 }
+
+#[tokio::test]
+async fn migration_backfills_canonical_tables_from_legacy_cache_entries() {
+    let cache_dir = tempdir().unwrap();
+    let db_path = cache_dir.path().join("cache.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE cache_entries (
+            key TEXT PRIMARY KEY,
+            resource TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            etag_or_version TEXT
+        );",
+    )
+    .unwrap();
+
+    let base_url = "http://127.0.0.1:9";
+    let sessions_scope = serde_json::json!({
+        "version": 1,
+        "base_url": base_url,
+        "user_email": "user@example.com",
+        "resource": "sessions",
+        "params": {
+            "location": "EVSE-1",
+            "limit": "1",
+            "order": "oldest-first-v1",
+            "from": "-",
+            "to": "-"
+        }
+    })
+    .to_string();
+    let tokens_scope = serde_json::json!({
+        "version": 1,
+        "base_url": base_url,
+        "user_email": "user@example.com",
+        "resource": "tokens",
+        "params": {
+            "limit": "1"
+        }
+    })
+    .to_string();
+    let key = serde_json::json!({
+        "scope": sessions_scope,
+        "profile": "DPC"
+    })
+    .to_string();
+    let token_key = serde_json::json!({
+        "scope": tokens_scope,
+        "profile": "DPC"
+    })
+    .to_string();
+
+    conn.execute(
+        "INSERT INTO cache_entries (key, resource, scope, payload_json, fetched_at, expires_at, etag_or_version)
+         VALUES (?1, 'sessions', ?2, ?3, 1_000, 9_999_999, NULL)",
+        rusqlite::params![
+            key,
+            sessions_scope,
+            serde_json::json!([{
+                "id": "sess-legacy",
+                "start_date_time": "2025-01-01T10:00:00Z",
+                "end_date_time": "2025-01-01T11:00:00Z",
+                "status": "COMPLETED",
+                "location_id": "EVSE-1"
+            }])
+            .to_string()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO cache_entries (key, resource, scope, payload_json, fetched_at, expires_at, etag_or_version)
+         VALUES (?1, 'tokens', ?2, ?3, 2_000, 9_999_999, NULL)",
+        rusqlite::params![
+            token_key,
+            tokens_scope,
+            serde_json::json!([{ "token_uid": "token-legacy" }]).to_string()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_BASE_URL", base_url)
+        .env("MOBIE_EMAIL", "user@example.com")
+        .env("MOBIE_PASSWORD", "password")
+        .env("MOBIE_CACHE_DIR", cache_dir.path())
+        .args(["--json", "tokens", "list", "--limit", "1"])
+        .output()
+        .expect("migrated token read");
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["data"][0]["token_uid"], "token-legacy");
+
+    let conn = Connection::open(db_path).unwrap();
+    let session_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let schema_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cache_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let sync_window_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_windows", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(session_rows, 1);
+    assert_eq!(schema_rows, 1);
+    assert_eq!(sync_window_rows, 0);
+}

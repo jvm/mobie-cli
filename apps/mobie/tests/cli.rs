@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use tempfile::tempdir;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -25,9 +26,11 @@ async fn mount_login(server: &MockServer) {
 
 fn cli(server: &MockServer) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("mobie"));
+    let cache_dir = tempdir().unwrap().keep();
     cmd.env("MOBIE_BASE_URL", server.uri());
     cmd.env("MOBIE_EMAIL", "user@example.com");
     cmd.env("MOBIE_PASSWORD", "secret");
+    cmd.env("MOBIE_CACHE_DIR", cache_dir);
     cmd
 }
 

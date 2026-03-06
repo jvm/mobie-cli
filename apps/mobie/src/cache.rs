@@ -248,7 +248,7 @@ impl CacheStore {
             )
         })?;
 
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .map_err(|err| format!("failed to open cache database {}: {err}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -386,6 +386,7 @@ impl CacheStore {
             params!["schema_version", schema_value],
         )
         .map_err(|err| format!("failed to record cache schema version: {err}"))?;
+        backfill_canonical_tables_from_cache_entries(&mut conn)?;
 
         Ok(Self { conn })
     }
@@ -1207,6 +1208,74 @@ fn ocpp_log_fingerprint(item: &Value) -> Result<String, String> {
 fn ocpp_log_sort_key(timestamp: Option<&str>, ordinal: usize) -> String {
     let timestamp = timestamp.unwrap_or("unknown-timestamp");
     format!("{timestamp}#{ordinal:08}")
+}
+
+fn backfill_canonical_tables_from_cache_entries(conn: &mut Connection) -> Result<(), String> {
+    let rows = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, resource, scope, payload_json, fetched_at, expires_at
+                 FROM cache_entries
+                 WHERE resource IN (
+                    'locations',
+                    'location',
+                    'sessions',
+                    'tokens',
+                    'logs',
+                    'location_analytics',
+                    'location_geojson',
+                    'ocpi_logs'
+                 )",
+            )
+            .map_err(|err| format!("failed to prepare cache-entry backfill scan: {err}"))?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|err| format!("failed to scan cache entries for backfill: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to load cache entries for backfill: {err}"))?
+    };
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("failed to start canonical backfill transaction: {err}"))?;
+
+    for (key, resource, scope, payload_json, fetched_at, expires_at) in rows {
+        let Some(lookup) = cache_lookup_from_scope_and_key(&scope, &key) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&payload_json) else {
+            continue;
+        };
+        sync_domain_tables(
+            &tx, &lookup, &resource, &scope, &payload, fetched_at, expires_at,
+        )?;
+    }
+
+    tx.commit()
+        .map_err(|err| format!("failed to commit canonical backfill transaction: {err}"))?;
+    Ok(())
+}
+
+fn cache_lookup_from_scope_and_key(scope: &str, key: &str) -> Option<CacheLookup> {
+    let scope_value = serde_json::from_str::<Value>(scope).ok()?;
+    let key_value = serde_json::from_str::<Value>(key).ok()?;
+    Some(CacheLookup {
+        base_url: scope_value.get("base_url")?.as_str()?.to_string(),
+        user_email: Some(scope_value.get("user_email")?.as_str()?.to_string()),
+        profile: Some(key_value.get("profile")?.as_str()?.to_string()),
+    })
 }
 
 fn scope_param_bool(scope: &str, key: &str) -> bool {
