@@ -301,6 +301,9 @@ Notes:
 
 - `charging_periods[].dimensions[].volume` may be numeric or string.
 - `cdr_token.type` is returned as `type`.
+- the API may return sessions that overlap the requested date window, not only sessions whose `start_date_time` falls fully inside it
+- `mobie` preserves that overlap behavior in its canonical local session query path
+- cached session rows are keyed locally by the API `id`
 
 ### List Tokens
 
@@ -373,6 +376,10 @@ Observed item fields:
 Notes:
 
 - `logs` may be a stringified JSON payload or a JSON value.
+- the API `id` appears to identify the charger/location, not a unique log entry
+- `mobie` therefore uses a synthetic local fingerprint for canonical log identity
+- local ordered reads use `timestamp` plus a deterministic sort key derived during ingestion
+- `logs list --error-only` is tracked separately in cache freshness scope from unfiltered OCPP log reads
 
 ### List OCPI Logs
 

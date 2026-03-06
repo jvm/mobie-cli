@@ -113,6 +113,26 @@ cargo run -p mobie -- --json sessions list --location MOBI-XXX-00000
 
 `sessions list --from/--to` maps to the MOBIE API's `dateFrom` / `dateTo` query params. Date-only values include the full day.
 
+## Cache Behavior
+
+`mobie` uses a hybrid local SQLite cache.
+
+- `sessions list` and OCPP `logs list` are canonical-record-backed.
+- `tokens list`, `logs ocpi`, `locations analytics`, and `locations geojson` remain response-cache-backed.
+- `locations list` and `locations get` still use the simpler snapshot cache path.
+
+For canonical resources:
+
+- full raw API documents are stored locally alongside indexed columns for querying
+- `sessions list` reads from canonical session rows after refresh
+- OCPP `logs list` reads from canonical log rows after refresh
+- `--json` and `--toon` include structured freshness metadata
+- terminal and Markdown output show a concise freshness line when available
+
+OCPP logs do not expose a durable per-entry id in the API payload, so the cache uses a synthetic local fingerprint for identity plus a deterministic sort key for ordered reads.
+
+Existing cache databases are migrated in place on open. Legacy `cache_entries` rows are backfilled into canonical tables when possible.
+
 ## Release Flow
 
 Homebrew releases are driven by Git tags:
