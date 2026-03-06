@@ -6,7 +6,10 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration as StdDuration;
 
-use cache::{CacheHandle, CacheLookup, CacheSpec, SessionQuery as CacheSessionQuery};
+use cache::{
+    CacheHandle, CacheLookup, CacheSpec, OcppLogQuery as CacheOcppLogQuery,
+    SessionQuery as CacheSessionQuery,
+};
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, SessionFilters};
@@ -277,9 +280,9 @@ enum Output {
     JsonArray(&'static str, Vec<Value>),
     Locations(Vec<LocationSummary>),
     Location(LocationDetail),
-    Sessions(Vec<Session>),
+    Sessions(Vec<Session>, Option<FreshnessMeta>),
     Tokens(Vec<TokenInfo>),
-    Logs(Vec<OcppLogEntry>),
+    Logs(Vec<OcppLogEntry>, Option<FreshnessMeta>),
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +348,97 @@ fn success_envelope<'a, T: Serialize>(
         data,
         meta: Some(Meta { count, freshness }),
     }
+}
+
+fn output_freshness(output: &Output) -> Option<&FreshnessMeta> {
+    match output {
+        Output::Sessions(_, freshness) | Output::Logs(_, freshness) => freshness.as_ref(),
+        _ => None,
+    }
+}
+
+fn freshness_from_window(
+    window: Option<&cache::SyncWindowRecord>,
+    ttl: StdDuration,
+    scope: String,
+    now_epoch_ms: i64,
+) -> Option<FreshnessMeta> {
+    let window = window?;
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+    let as_of_epoch_ms = window.last_success_epoch_ms;
+    let stale_after_epoch_ms = as_of_epoch_ms.map(|ts| ts.saturating_add(ttl_ms));
+    let state = if window.is_fresh_at(now_epoch_ms, ttl) {
+        "fresh"
+    } else {
+        "stale"
+    };
+    let detail = match window.status.as_str() {
+        "success" => None,
+        other => Some(other.to_string()),
+    };
+
+    Some(FreshnessMeta {
+        state,
+        source: Some("cache"),
+        as_of_epoch_ms,
+        refreshed_at_epoch_ms: window
+            .last_attempt_epoch_ms
+            .or(window.last_success_epoch_ms),
+        stale_after_epoch_ms,
+        scope: Some(scope),
+        detail,
+    })
+}
+
+fn freshness_from_windows(
+    windows: &[cache::SyncWindowRecord],
+    ttl: StdDuration,
+    scope: String,
+    now_epoch_ms: i64,
+) -> Option<FreshnessMeta> {
+    if windows.is_empty() {
+        return None;
+    }
+
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+    let as_of_epoch_ms = windows
+        .iter()
+        .filter_map(|window| window.last_success_epoch_ms)
+        .min();
+    let refreshed_at_epoch_ms = windows
+        .iter()
+        .filter_map(|window| {
+            window
+                .last_attempt_epoch_ms
+                .or(window.last_success_epoch_ms)
+        })
+        .max();
+    let stale_after_epoch_ms = windows
+        .iter()
+        .filter_map(|window| window.last_success_epoch_ms)
+        .map(|ts| ts.saturating_add(ttl_ms))
+        .min();
+    let detail = windows
+        .iter()
+        .find(|window| window.status != "success")
+        .map(|window| window.status.clone());
+
+    Some(FreshnessMeta {
+        state: if windows
+            .iter()
+            .all(|window| window.is_fresh_at(now_epoch_ms, ttl))
+        {
+            "fresh"
+        } else {
+            "stale"
+        },
+        source: Some("cache"),
+        as_of_epoch_ms,
+        refreshed_at_epoch_ms,
+        stale_after_epoch_ms,
+        scope: Some(scope),
+        detail,
+    })
 }
 
 #[derive(Debug)]
@@ -674,6 +768,22 @@ async fn execute_cached_session_command<S: SessionStore>(
                 }
             }
 
+            let freshness = freshness_from_window(
+                cache
+                    .get_sync_window(
+                        "sessions",
+                        &plan.scope,
+                        Some(&plan.refresh.window_start),
+                        Some(&plan.refresh.window_end),
+                    )
+                    .ok()
+                    .flatten()
+                    .as_ref(),
+                sessions_ttl(),
+                plan.scope.clone(),
+                current_epoch_ms(),
+            );
+
             Ok(Output::Sessions(
                 cache
                     .read_sessions(
@@ -690,6 +800,7 @@ async fn execute_cached_session_command<S: SessionStore>(
                         },
                     )
                     .map_err(AppError::InvalidInput)?,
+                freshness,
             ))
         }
     }
@@ -776,11 +887,7 @@ async fn execute_cached_log_command<S: SessionStore>(
 
             if needs_refresh {
                 let mut authed = resolve_authenticated_client(cli, store).await?;
-                match authed
-                    .client
-                    .sync_ocpp_logs_window(limit, error_only)
-                    .await
-                {
+                match authed.client.sync_ocpp_logs_window(limit, error_only).await {
                     Ok(data) => {
                         persist_session_if_needed(store, cli, &authed)?;
 
@@ -835,14 +942,95 @@ async fn execute_cached_log_command<S: SessionStore>(
                         }
 
                         if let Some(cached) = cached_logs {
-                            return Ok(Output::Logs(cached));
+                            let logs = cache
+                                .read_ocpp_logs(
+                                    &lookup,
+                                    &CacheOcppLogQuery {
+                                        limit: usize::try_from(plan.query.limit)
+                                            .unwrap_or(usize::MAX),
+                                        error_only: plan.query.error_only,
+                                        oldest_first: matches!(
+                                            plan.query.order,
+                                            LogOrder::OldestFirst
+                                        ),
+                                    },
+                                )
+                                .map_err(AppError::InvalidInput)?;
+                            let freshness =
+                                freshness_from_windows(
+                                    &plan
+                                        .windows
+                                        .iter()
+                                        .filter_map(|window| {
+                                            cache
+                                                .get_sync_window(
+                                                    "logs",
+                                                    &window.scope,
+                                                    Some(&window.day_start.to_rfc3339_opts(
+                                                        SecondsFormat::Secs,
+                                                        true,
+                                                    )),
+                                                    Some(&window.day_end.to_rfc3339_opts(
+                                                        SecondsFormat::Secs,
+                                                        true,
+                                                    )),
+                                                )
+                                                .ok()
+                                                .flatten()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    logs_ttl(),
+                                    plan.windows[0].scope.clone(),
+                                    current_epoch_ms(),
+                                );
+                            return Ok(Output::Logs(
+                                if logs.is_empty() { cached } else { logs },
+                                freshness,
+                            ));
                         }
                         return Err(AppError::from(err));
                     }
                 }
             }
 
-            Ok(Output::Logs(cached_logs.unwrap_or_default()))
+            let logs = cache
+                .read_ocpp_logs(
+                    &lookup,
+                    &CacheOcppLogQuery {
+                        limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
+                        error_only: plan.query.error_only,
+                        oldest_first: matches!(plan.query.order, LogOrder::OldestFirst),
+                    },
+                )
+                .map_err(AppError::InvalidInput)?;
+            let freshness = freshness_from_windows(
+                &plan
+                    .windows
+                    .iter()
+                    .filter_map(|window| {
+                        cache
+                            .get_sync_window(
+                                "logs",
+                                &window.scope,
+                                Some(&window.day_start.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                                Some(&window.day_end.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                            )
+                            .ok()
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>(),
+                logs_ttl(),
+                plan.windows[0].scope.clone(),
+                current_epoch_ms(),
+            );
+            Ok(Output::Logs(
+                if logs.is_empty() {
+                    cached_logs.unwrap_or_default()
+                } else {
+                    logs
+                },
+                freshness,
+            ))
         }
         LogCommand::Ocpi { limit } => {
             let limit = *limit;
@@ -1108,7 +1296,7 @@ struct OcppLogQueryPlan {
 #[allow(dead_code)]
 fn ocpp_log_query_plan(limit: i64, error_only: bool, now: DateTime<Utc>) -> OcppLogQueryPlan {
     OcppLogQueryPlan {
-        windows: ocpp_log_sync_windows(now),
+        windows: ocpp_log_sync_windows(now, error_only),
         query: OcppLogLocalQuery {
             limit,
             error_only,
@@ -1118,14 +1306,18 @@ fn ocpp_log_query_plan(limit: i64, error_only: bool, now: DateTime<Utc>) -> Ocpp
 }
 
 #[allow(dead_code)]
-fn ocpp_log_sync_windows(now: DateTime<Utc>) -> Vec<OcppLogSyncWindow> {
+fn ocpp_log_sync_windows(now: DateTime<Utc>, error_only: bool) -> Vec<OcppLogSyncWindow> {
     let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
     let day_end = day_start
         .checked_add_days(Days::new(1))
         .expect("valid next-day boundary");
 
     vec![OcppLogSyncWindow {
-        scope: "all-chargers".to_string(),
+        scope: if error_only {
+            "all-chargers:error-only".to_string()
+        } else {
+            "all-chargers:all".to_string()
+        },
         day_start,
         day_end,
     }]
@@ -1400,6 +1592,7 @@ fn format_api_timestamp(dt: DateTime<Utc>) -> String {
 
 fn render_output(cli: &Cli, output: &Output) -> Result<(), Box<dyn std::error::Error>> {
     if cli.json {
+        let freshness = output_freshness(output).cloned();
         match output {
             Output::Auth(data) => write_json("auth", data, 1, cli.pretty)?,
             Output::AuthStatus(data) => write_json("auth_status", data, 1, cli.pretty)?,
@@ -1410,9 +1603,13 @@ fn render_output(cli: &Cli, output: &Output) -> Result<(), Box<dyn std::error::E
             }
             Output::Locations(data) => write_json("locations", data, data.len(), cli.pretty)?,
             Output::Location(data) => write_json("location", data, 1, cli.pretty)?,
-            Output::Sessions(data) => write_json("sessions", data, data.len(), cli.pretty)?,
+            Output::Sessions(data, _) => {
+                write_json_with_freshness("sessions", data, data.len(), freshness, cli.pretty)?
+            }
             Output::Tokens(data) => write_json("tokens", data, data.len(), cli.pretty)?,
-            Output::Logs(data) => write_json("logs", data, data.len(), cli.pretty)?,
+            Output::Logs(data, _) => {
+                write_json_with_freshness("logs", data, data.len(), freshness, cli.pretty)?
+            }
         }
         return Ok(());
     }
@@ -1500,9 +1697,12 @@ fn render_markdown_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                 &serde_json::to_value(data).map_err(Box::<dyn std::error::Error>::from)?,
             );
         }
-        Output::Sessions(data) => {
+        Output::Sessions(data, freshness) => {
             println!("# Sessions\n");
             println!("Count: {}\n", data.len());
+            if let Some(freshness) = freshness {
+                println!("Freshness: {}\n", freshness.state);
+            }
             render_markdown_table(
                 &[
                     "id",
@@ -1545,9 +1745,12 @@ fn render_markdown_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                     .collect(),
             )
         }
-        Output::Logs(data) => {
+        Output::Logs(data, freshness) => {
             println!("# OCPP Logs\n");
             println!("Count: {}\n", data.len());
+            if let Some(freshness) = freshness {
+                println!("Freshness: {}\n", freshness.state);
+            }
             render_markdown_table(
                 &["timestamp", "message_type", "direction", "location_id"],
                 data.iter()
@@ -1614,8 +1817,11 @@ fn render_terminal_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                 &serde_json::to_value(data).map_err(Box::<dyn std::error::Error>::from)?,
             );
         }
-        Output::Sessions(data) => {
+        Output::Sessions(data, freshness) => {
             println!("Sessions ({})", data.len());
+            if let Some(freshness) = freshness {
+                println!("freshness: {}", freshness.state);
+            }
             render_plain_table(
                 &[
                     "id",
@@ -1657,8 +1863,11 @@ fn render_terminal_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                     .collect(),
             );
         }
-        Output::Logs(data) => {
+        Output::Logs(data, freshness) => {
             println!("OCPP Logs ({})", data.len());
+            if let Some(freshness) = freshness {
+                println!("freshness: {}", freshness.state);
+            }
             render_plain_table(
                 &["timestamp", "message_type", "direction", "location_id"],
                 data.iter()
@@ -1689,9 +1898,9 @@ fn output_resource(output: &Output) -> &'static str {
         Output::JsonArray(resource, _) => resource,
         Output::Locations(_) => "locations",
         Output::Location(_) => "location",
-        Output::Sessions(_) => "sessions",
+        Output::Sessions(_, _) => "sessions",
         Output::Tokens(_) => "tokens",
-        Output::Logs(_) => "logs",
+        Output::Logs(_, _) => "logs",
     }
 }
 
@@ -2261,9 +2470,19 @@ fn write_json<T: Serialize>(
     count: usize,
     pretty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_json_with_freshness(resource, data, count, None, pretty)
+}
+
+fn write_json_with_freshness<T: Serialize>(
+    resource: &'static str,
+    data: &T,
+    count: usize,
+    freshness: Option<FreshnessMeta>,
+    pretty: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    let envelope = success_envelope(resource, data, count, None);
+    let envelope = success_envelope(resource, data, count, freshness);
     if pretty {
         serde_json::to_writer_pretty(&mut handle, &envelope)?;
     } else {
@@ -2274,6 +2493,7 @@ fn write_json<T: Serialize>(
 }
 
 fn render_toon_output(output: &Output, _pretty: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let freshness = output_freshness(output).cloned();
     match output {
         Output::Auth(data) => write_toon("auth", data, 1)?,
         Output::AuthStatus(data) => write_toon("auth_status", data, 1)?,
@@ -2282,9 +2502,11 @@ fn render_toon_output(output: &Output, _pretty: bool) -> Result<(), Box<dyn std:
         Output::JsonArray(resource, data) => write_toon(*resource, data, data.len())?,
         Output::Locations(data) => write_toon("locations", data, data.len())?,
         Output::Location(data) => write_toon("location", data, 1)?,
-        Output::Sessions(data) => write_toon("sessions", data, data.len())?,
+        Output::Sessions(data, _) => {
+            write_toon_with_freshness("sessions", data, data.len(), freshness)?
+        }
         Output::Tokens(data) => write_toon("tokens", data, data.len())?,
-        Output::Logs(data) => write_toon("logs", data, data.len())?,
+        Output::Logs(data, _) => write_toon_with_freshness("logs", data, data.len(), freshness)?,
     }
     Ok(())
 }
@@ -2294,7 +2516,16 @@ fn write_toon<T: Serialize>(
     data: &T,
     count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let envelope = success_envelope(resource, data, count, None);
+    write_toon_with_freshness(resource, data, count, None)
+}
+
+fn write_toon_with_freshness<T: Serialize>(
+    resource: &'static str,
+    data: &T,
+    count: usize,
+    freshness: Option<FreshnessMeta>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let envelope = success_envelope(resource, data, count, freshness);
     let value = serde_json::to_value(&envelope)?;
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -2919,9 +3150,11 @@ mod tests {
 
         let params = session_cache_params("EVSE-1", 50, &filters);
 
-        assert!(params.iter().any(|(key, value)| {
-            *key == "order" && value == ORDERING_CACHE_VERSION
-        }));
+        assert!(
+            params
+                .iter()
+                .any(|(key, value)| { *key == "order" && value == ORDERING_CACHE_VERSION })
+        );
     }
 
     #[test]
@@ -2963,7 +3196,10 @@ mod tests {
         let plan = session_query_plan("EVSE-1", 50, &filters, now);
 
         assert_eq!(plan.scope, "location:EVSE-1");
-        assert_eq!(plan.query.date_from.as_deref(), Some("2026-03-01T00:00:00.000Z"));
+        assert_eq!(
+            plan.query.date_from.as_deref(),
+            Some("2026-03-01T00:00:00.000Z")
+        );
         assert_eq!(plan.query.date_to, None);
         assert_eq!(
             plan.refresh,
@@ -3011,24 +3247,28 @@ mod tests {
         let ocpp_params = ocpp_log_cache_params(25, true);
         let ocpi_params = ocpi_log_cache_params(25);
 
-        assert!(ocpp_params.iter().any(|(key, value)| {
-            *key == "order" && value == ORDERING_CACHE_VERSION
-        }));
-        assert!(ocpi_params.iter().any(|(key, value)| {
-            *key == "order" && value == ORDERING_CACHE_VERSION
-        }));
+        assert!(
+            ocpp_params
+                .iter()
+                .any(|(key, value)| { *key == "order" && value == ORDERING_CACHE_VERSION })
+        );
+        assert!(
+            ocpi_params
+                .iter()
+                .any(|(key, value)| { *key == "order" && value == ORDERING_CACHE_VERSION })
+        );
     }
 
     #[test]
     fn ocpp_log_sync_windows_use_day_bucket_for_current_utc_day() {
         let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
 
-        let windows = ocpp_log_sync_windows(anchor);
+        let windows = ocpp_log_sync_windows(anchor, false);
 
         assert_eq!(
             windows,
             vec![OcppLogSyncWindow {
-                scope: "all-chargers".to_string(),
+                scope: "all-chargers:all".to_string(),
                 day_start: Utc.with_ymd_and_hms(2026, 3, 6, 0, 0, 0).unwrap(),
                 day_end: Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap(),
             }]
@@ -3050,7 +3290,7 @@ mod tests {
             }
         );
         assert_eq!(plan.windows.len(), 1);
-        assert_eq!(plan.windows[0].scope, "all-chargers");
+        assert_eq!(plan.windows[0].scope, "all-chargers:error-only");
     }
 
     #[test]

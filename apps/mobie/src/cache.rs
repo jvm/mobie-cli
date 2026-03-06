@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
-use mobie_models::Session;
+use mobie_models::{OcppLogEntry, Session};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -55,6 +55,13 @@ pub struct SessionQuery {
     pub from: Option<String>,
     pub to: Option<String>,
     pub limit: usize,
+    pub oldest_first: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OcppLogQuery {
+    pub limit: usize,
+    pub error_only: bool,
     pub oldest_first: bool,
 }
 
@@ -187,6 +194,18 @@ impl CacheHandle {
 
         store.read_sessions(lookup, query)
     }
+
+    pub fn read_ocpp_logs(
+        &self,
+        lookup: &CacheLookup,
+        query: &OcppLogQuery,
+    ) -> Result<Vec<OcppLogEntry>, String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        store.read_ocpp_logs(lookup, query)
+    }
 }
 
 impl SyncWindowRecord {
@@ -299,6 +318,7 @@ impl CacheStore {
                  timestamp TEXT,
                  message_type TEXT,
                  direction TEXT,
+                 is_error INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (base_url, user_email, profile, log_key)
              );
              CREATE TABLE IF NOT EXISTS json_resources (
@@ -332,11 +352,18 @@ impl CacheStore {
              CREATE INDEX IF NOT EXISTS idx_json_resources_scope ON json_resources(scope);",
         )
         .map_err(|err| format!("failed to initialize cache schema: {err}"))?;
-        ensure_column_exists(&conn, "ocpp_logs", "fingerprint", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column_exists(
+            &conn,
+            "ocpp_logs",
+            "fingerprint",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         ensure_column_exists(&conn, "ocpp_logs", "sort_key", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column_exists(&conn, "ocpp_logs", "is_error", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_ocpp_logs_scope_sort_key ON ocpp_logs(scope, sort_key);
-             CREATE INDEX IF NOT EXISTS idx_ocpp_logs_fingerprint ON ocpp_logs(fingerprint);",
+             CREATE INDEX IF NOT EXISTS idx_ocpp_logs_fingerprint ON ocpp_logs(fingerprint);
+             CREATE INDEX IF NOT EXISTS idx_ocpp_logs_error_timestamp ON ocpp_logs(is_error, timestamp);",
         )
         .map_err(|err| format!("failed to initialize ocpp_logs indexes: {err}"))?;
 
@@ -399,7 +426,14 @@ impl CacheStore {
                     last_attempt_epoch_ms = excluded.last_attempt_epoch_ms,
                     status = excluded.status,
                     error_json = excluded.error_json",
-                params![resource, scope, window_start, window_end, at_epoch_ms, error_json],
+                params![
+                    resource,
+                    scope,
+                    window_start,
+                    window_end,
+                    at_epoch_ms,
+                    error_json
+                ],
             )
             .map_err(|err| format!("failed to record sync failure: {err}"))?;
         Ok(())
@@ -459,7 +493,7 @@ impl CacheStore {
                AND user_email = ?2
                AND profile = ?3
                AND location_id = ?4
-               AND (?5 IS NULL OR start_date_time >= ?5)
+               AND (?5 IS NULL OR end_date_time IS NULL OR end_date_time >= ?5)
                AND (?6 IS NULL OR start_date_time < ?6)
              ORDER BY start_date_time {order}, session_id {order}
              LIMIT ?7"
@@ -488,6 +522,55 @@ impl CacheStore {
             let payload_json = row.map_err(|err| format!("failed to read session row: {err}"))?;
             serde_json::from_str::<Session>(&payload_json)
                 .map_err(|err| format!("failed to decode cached session row: {err}"))
+        })
+        .collect()
+    }
+
+    fn read_ocpp_logs(
+        &self,
+        lookup: &CacheLookup,
+        query: &OcppLogQuery,
+    ) -> Result<Vec<OcppLogEntry>, String> {
+        let Some(user_email) = lookup.user_email.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(profile) = lookup.profile.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let order = if query.oldest_first { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT payload_json
+             FROM ocpp_logs
+             WHERE base_url = ?1
+               AND user_email = ?2
+               AND profile = ?3
+               AND (?4 = 0 OR is_error = 1)
+             ORDER BY timestamp {order}, sort_key {order}, log_key {order}
+             LIMIT ?5"
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| format!("failed to prepare OCPP log query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    lookup.base_url,
+                    user_email,
+                    profile,
+                    query.error_only,
+                    i64::try_from(query.limit).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| format!("failed to execute OCPP log query: {err}"))?;
+
+        rows.map(|row| {
+            let payload_json = row.map_err(|err| format!("failed to read OCPP log row: {err}"))?;
+            serde_json::from_str::<OcppLogEntry>(&payload_json)
+                .map_err(|err| format!("failed to decode cached OCPP log row: {err}"))
         })
         .collect()
     }
@@ -838,6 +921,7 @@ fn sync_sessions(
     let items = payload
         .as_array()
         .ok_or_else(|| "sessions payload was not an array".to_string())?;
+    let scoped_location_id = scope_param_string(scope, "location");
     tx.execute("DELETE FROM sessions WHERE scope = ?1", params![scope])
         .map_err(|err| format!("failed to clear sessions scope: {err}"))?;
 
@@ -884,7 +968,9 @@ fn sync_sessions(
                 item.get("start_date_time").and_then(json_scalar_to_string),
                 item.get("end_date_time").and_then(json_scalar_to_string),
                 item.get("status").and_then(json_scalar_to_string),
-                item.get("location_id").and_then(json_scalar_to_string),
+                item.get("location_id")
+                    .and_then(json_scalar_to_string)
+                    .or_else(|| scoped_location_id.clone()),
                 item.get("evse_uid").and_then(json_scalar_to_string),
                 item.get("connector_id").and_then(json_scalar_to_string),
                 token_uid,
@@ -960,6 +1046,7 @@ fn sync_ocpp_logs(
     let items = payload
         .as_array()
         .ok_or_else(|| "logs payload was not an array".to_string())?;
+    let is_error_scope = scope_param_bool(scope, "error_only");
     tx.execute("DELETE FROM ocpp_logs WHERE scope = ?1", params![scope])
         .map_err(|err| format!("failed to clear logs scope: {err}"))?;
 
@@ -974,8 +1061,8 @@ fn sync_ocpp_logs(
         tx.execute(
             "INSERT INTO ocpp_logs (
                 base_url, user_email, profile, log_key, scope, payload_json, fetched_at, expires_at,
-                log_id, timestamp, message_type, direction, fingerprint, sort_key
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                log_id, timestamp, message_type, direction, fingerprint, sort_key, is_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(base_url, user_email, profile, log_key) DO UPDATE SET
                 scope = excluded.scope,
                 payload_json = excluded.payload_json,
@@ -986,7 +1073,8 @@ fn sync_ocpp_logs(
                 message_type = excluded.message_type,
                 direction = excluded.direction,
                 fingerprint = excluded.fingerprint,
-                sort_key = min(ocpp_logs.sort_key, excluded.sort_key)",
+                sort_key = min(ocpp_logs.sort_key, excluded.sort_key),
+                is_error = max(ocpp_logs.is_error, excluded.is_error)",
             params![
                 base_url,
                 user_email,
@@ -1001,7 +1089,8 @@ fn sync_ocpp_logs(
                 ocpp_log_field(item, &["message_type", "messageType"]),
                 item.get("direction").and_then(json_scalar_to_string),
                 fingerprint,
-                sort_key
+                sort_key,
+                is_error_scope
             ],
         )
         .map_err(|err| format!("failed to upsert log row: {err}"))?;
@@ -1078,6 +1167,21 @@ fn ocpp_log_fingerprint(item: &Value) -> Result<String, String> {
 fn ocpp_log_sort_key(timestamp: Option<&str>, ordinal: usize) -> String {
     let timestamp = timestamp.unwrap_or("unknown-timestamp");
     format!("{timestamp}#{ordinal:08}")
+}
+
+fn scope_param_bool(scope: &str, key: &str) -> bool {
+    scope_param_string(scope, key).is_some_and(|value| value == "true")
+}
+
+fn scope_param_string(scope: &str, key: &str) -> Option<String> {
+    let Ok(value) = serde_json::from_str::<Value>(scope) else {
+        return None;
+    };
+    value
+        .get("params")
+        .and_then(|params| params.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn ensure_column_exists(
@@ -1469,7 +1573,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, ocpp_log_fingerprint(&repeated).unwrap());
-        assert_eq!(rows[0].1, ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 0));
+        assert_eq!(
+            rows[0].1,
+            ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 0)
+        );
     }
 
     #[test]
@@ -1588,7 +1695,168 @@ mod tests {
             )
             .unwrap();
 
-        let ids = sessions.into_iter().map(|session| session.id).collect::<Vec<_>>();
+        let ids = sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
         assert_eq!(ids, vec!["sess-1", "sess-2"]);
+    }
+
+    #[test]
+    fn read_sessions_keeps_overlap_within_requested_window() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let mut store = CacheStore::open_at(path).unwrap();
+        let lookup = CacheLookup {
+            base_url: "https://pgm.mobie.pt".to_string(),
+            user_email: Some("user@example.com".to_string()),
+            profile: Some("DPC".to_string()),
+        };
+
+        store
+            .put(
+                &lookup,
+                &CacheSpec {
+                    resource: "sessions",
+                    ttl: Duration::from_secs(60),
+                    params: vec![("location", "LOC-1".to_string())],
+                },
+                &vec![
+                    serde_json::json!({
+                        "id": "sess-overlap",
+                        "start_date_time": "2026-03-01T23:30:00Z",
+                        "end_date_time": "2026-03-02T00:30:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-1"
+                    }),
+                    serde_json::json!({
+                        "id": "sess-inside",
+                        "start_date_time": "2026-03-02T10:00:00Z",
+                        "end_date_time": "2026-03-02T11:00:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-1"
+                    }),
+                ],
+            )
+            .unwrap();
+
+        let sessions = store
+            .read_sessions(
+                &lookup,
+                &SessionQuery {
+                    location_id: "LOC-1".to_string(),
+                    from: Some("2026-03-02T00:00:00Z".to_string()),
+                    to: Some("2026-03-03T00:00:00Z".to_string()),
+                    limit: 10,
+                    oldest_first: true,
+                },
+            )
+            .unwrap();
+
+        let ids = sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["sess-overlap", "sess-inside"]);
+    }
+
+    #[test]
+    fn read_ocpp_logs_filters_orders_and_limits_results() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let mut store = CacheStore::open_at(path).unwrap();
+        let lookup = CacheLookup {
+            base_url: "https://pgm.mobie.pt".to_string(),
+            user_email: Some("user@example.com".to_string()),
+            profile: Some("DPC".to_string()),
+        };
+
+        store
+            .put(
+                &lookup,
+                &CacheSpec {
+                    resource: "logs",
+                    ttl: Duration::from_secs(60),
+                    params: vec![
+                        ("limit", "10".to_string()),
+                        ("error_only", "true".to_string()),
+                    ],
+                },
+                &vec![
+                    serde_json::json!({
+                        "id": "LOC-1",
+                        "messageType": "Heartbeat",
+                        "direction": "Response",
+                        "timestamp": "2026-03-06T10:00:00Z",
+                        "logs": "{\"status\":\"ok\"}"
+                    }),
+                    serde_json::json!({
+                        "id": "LOC-1",
+                        "messageType": "Authorize",
+                        "direction": "Request",
+                        "timestamp": "2026-03-06T09:00:00Z",
+                        "logs": "{\"idTag\":\"abc\"}"
+                    }),
+                ],
+            )
+            .unwrap();
+        store
+            .put(
+                &lookup,
+                &CacheSpec {
+                    resource: "logs",
+                    ttl: Duration::from_secs(60),
+                    params: vec![
+                        ("limit", "10".to_string()),
+                        ("error_only", "false".to_string()),
+                    ],
+                },
+                &vec![serde_json::json!({
+                    "id": "LOC-1",
+                    "messageType": "MeterValues",
+                    "direction": "Request",
+                    "timestamp": "2026-03-06T08:00:00Z",
+                    "logs": "{\"transactionId\":123}"
+                })],
+            )
+            .unwrap();
+
+        let error_logs = store
+            .read_ocpp_logs(
+                &lookup,
+                &OcppLogQuery {
+                    limit: 10,
+                    error_only: true,
+                    oldest_first: true,
+                },
+            )
+            .unwrap();
+        let error_timestamps = error_logs
+            .into_iter()
+            .map(|log| log.timestamp.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            error_timestamps,
+            vec!["2026-03-06T09:00:00Z", "2026-03-06T10:00:00Z"]
+        );
+
+        let all_logs = store
+            .read_ocpp_logs(
+                &lookup,
+                &OcppLogQuery {
+                    limit: 2,
+                    error_only: false,
+                    oldest_first: true,
+                },
+            )
+            .unwrap();
+        let all_timestamps = all_logs
+            .into_iter()
+            .map(|log| log.timestamp.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_timestamps,
+            vec!["2026-03-06T08:00:00Z", "2026-03-06T09:00:00Z"]
+        );
     }
 }
