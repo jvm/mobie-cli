@@ -138,16 +138,20 @@ async fn schema_contains_cache_meta_and_sync_windows() {
         );
     }
 
-    let mut columns_stmt = conn
-        .prepare("PRAGMA table_info(ocpp_logs)")
-        .unwrap();
+    let mut columns_stmt = conn.prepare("PRAGMA table_info(ocpp_logs)").unwrap();
     let columns = columns_stmt
         .query_map([], |row| row.get::<_, String>(1))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    for expected in ["payload_json", "fetched_at", "expires_at", "fingerprint", "sort_key"] {
+    for expected in [
+        "payload_json",
+        "fetched_at",
+        "expires_at",
+        "fingerprint",
+        "sort_key",
+    ] {
         assert!(
             columns.iter().any(|column| column == expected),
             "expected ocpp_logs column {expected} to exist, columns were {columns:?}"
@@ -348,4 +352,135 @@ async fn unwritable_cache_directory_degrades_to_live_fetch_with_terminal_warning
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("warning: cache disabled:"));
+}
+
+#[tokio::test]
+async fn response_cache_policy_keeps_sessions_and_logs_canonical_state_after_snapshot_deletion() {
+    let cache_dir = tempdir().unwrap();
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    mock_login(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{
+                "id": "sess-1",
+                "start_date_time": "2025-01-01T10:00:00Z",
+                "end_date_time": "2025-01-01T11:00:00Z",
+                "status": "COMPLETED"
+            }],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "1"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/logs/ocpp"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("error", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{
+                "id": "MOBI-AAA-00001",
+                "messageType": "Heartbeat",
+                "direction": "Response",
+                "timestamp": "2025-01-03T10:00:00Z",
+                "logs": "{}"
+            }],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/logs/ocpp"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "1"))
+        .and(query_param("error", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let sessions_seed = cli(&base_url, cache_dir.path())
+        .args([
+            "--json",
+            "sessions",
+            "list",
+            "--location",
+            "EVSE-1",
+            "--limit",
+            "2",
+        ])
+        .output()
+        .expect("seed sessions");
+    assert!(sessions_seed.status.success());
+
+    let logs_seed = cli(&base_url, cache_dir.path())
+        .args(["--json", "logs", "list", "--limit", "2", "--error-only"])
+        .output()
+        .expect("seed logs");
+    assert!(logs_seed.status.success());
+
+    let conn = Connection::open(cache_dir.path().join("cache.db")).unwrap();
+    conn.execute(
+        "DELETE FROM cache_entries WHERE resource IN ('sessions', 'logs')",
+        [],
+    )
+    .unwrap();
+
+    let snapshot_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cache_entries WHERE resource IN ('sessions', 'logs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let session_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let log_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ocpp_logs", [], |row| row.get(0))
+        .unwrap();
+    let sync_window_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_windows WHERE resource IN ('sessions', 'logs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(snapshot_rows, 0);
+    assert_eq!(session_rows, 1);
+    assert_eq!(log_rows, 1);
+    assert_eq!(sync_window_rows, 2);
 }

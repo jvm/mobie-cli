@@ -206,6 +206,14 @@ impl CacheHandle {
 
         store.read_ocpp_logs(lookup, query)
     }
+
+    pub fn infer_profile(&self, lookup: &CacheLookup) -> Result<Option<String>, String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+
+        store.infer_profile(lookup)
+    }
 }
 
 impl SyncWindowRecord {
@@ -573,6 +581,38 @@ impl CacheStore {
                 .map_err(|err| format!("failed to decode cached OCPP log row: {err}"))
         })
         .collect()
+    }
+
+    fn infer_profile(&self, lookup: &CacheLookup) -> Result<Option<String>, String> {
+        let Some(user_email) = lookup.user_email.as_deref() else {
+            return Ok(None);
+        };
+
+        self.conn
+            .query_row(
+                "SELECT profile FROM (
+                    SELECT profile, fetched_at FROM sessions
+                    WHERE base_url = ?1 AND user_email = ?2
+                    UNION ALL
+                    SELECT profile, fetched_at FROM ocpp_logs
+                    WHERE base_url = ?1 AND user_email = ?2
+                    UNION ALL
+                    SELECT profile, fetched_at FROM locations
+                    WHERE base_url = ?1 AND user_email = ?2
+                    UNION ALL
+                    SELECT profile, fetched_at FROM tokens
+                    WHERE base_url = ?1 AND user_email = ?2
+                    UNION ALL
+                    SELECT profile, fetched_at FROM json_resources
+                    WHERE base_url = ?1 AND user_email = ?2
+                 )
+                 ORDER BY fetched_at DESC
+                 LIMIT 1",
+                params![lookup.base_url, user_email],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| format!("failed to infer cached profile: {err}"))
     }
 
     fn get<T>(&mut self, lookup: &CacheLookup, spec: &CacheSpec) -> Result<Option<T>, String>

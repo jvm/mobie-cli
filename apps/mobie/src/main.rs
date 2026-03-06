@@ -27,6 +27,19 @@ fn current_epoch_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheResourceStrategy {
+    CanonicalRecords,
+    SnapshotEntries,
+}
+
+fn cache_resource_strategy(resource: &str) -> CacheResourceStrategy {
+    match resource {
+        "sessions" | "logs" => CacheResourceStrategy::CanonicalRecords,
+        _ => CacheResourceStrategy::SnapshotEntries,
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionQueryOrder {
@@ -711,11 +724,22 @@ async fn execute_cached_session_command<S: SessionStore>(
             from,
             to,
         } => {
+            debug_assert!(matches!(
+                cache_resource_strategy("sessions"),
+                CacheResourceStrategy::CanonicalRecords
+            ));
             let location = location.clone();
             let limit = *limit;
             let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
             let plan = session_query_plan(&location, limit, &filters, Utc::now());
             let mut lookup = cache_lookup(cli, store)?;
+            if lookup.profile.is_none() {
+                match cache.infer_profile(&lookup) {
+                    Ok(Some(profile)) => lookup.profile = Some(profile),
+                    Ok(None) => {}
+                    Err(err) => cache_warn(cli, cache, &err),
+                }
+            }
             cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 
             let needs_refresh = match (
@@ -848,6 +872,10 @@ async fn execute_cached_log_command<S: SessionStore>(
 ) -> Result<Output, AppError> {
     match command {
         LogCommand::List { limit, error_only } => {
+            debug_assert!(matches!(
+                cache_resource_strategy("logs"),
+                CacheResourceStrategy::CanonicalRecords
+            ));
             let limit = *limit;
             let error_only = *error_only;
             let plan = ocpp_log_query_plan(limit, error_only, Utc::now());
@@ -857,6 +885,13 @@ async fn execute_cached_log_command<S: SessionStore>(
                 params: ocpp_log_cache_params(limit, error_only),
             };
             let mut lookup = cache_lookup(cli, store)?;
+            if lookup.profile.is_none() {
+                match cache.infer_profile(&lookup) {
+                    Ok(Some(profile)) => lookup.profile = Some(profile),
+                    Ok(None) => {}
+                    Err(err) => cache_warn(cli, cache, &err),
+                }
+            }
             cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 
             let mut cached_logs = match cache.get(&lookup, &spec) {
@@ -1074,6 +1109,10 @@ where
         &'a mut MobieClient,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<T, AppError>> + 'a>>,
 {
+    debug_assert!(matches!(
+        cache_resource_strategy(spec.resource),
+        CacheResourceStrategy::SnapshotEntries
+    ));
     let lookup = cache_lookup(cli, store)?;
     cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
     match cache.get(&lookup, &spec) {
@@ -3291,6 +3330,30 @@ mod tests {
         );
         assert_eq!(plan.windows.len(), 1);
         assert_eq!(plan.windows[0].scope, "all-chargers:error-only");
+    }
+
+    #[test]
+    fn cache_resource_strategy_splits_canonical_and_snapshot_resources() {
+        assert_eq!(
+            cache_resource_strategy("sessions"),
+            CacheResourceStrategy::CanonicalRecords
+        );
+        assert_eq!(
+            cache_resource_strategy("logs"),
+            CacheResourceStrategy::CanonicalRecords
+        );
+        assert_eq!(
+            cache_resource_strategy("tokens"),
+            CacheResourceStrategy::SnapshotEntries
+        );
+        assert_eq!(
+            cache_resource_strategy("ocpi_logs"),
+            CacheResourceStrategy::SnapshotEntries
+        );
+        assert_eq!(
+            cache_resource_strategy("location_analytics"),
+            CacheResourceStrategy::SnapshotEntries
+        );
     }
 
     #[test]
