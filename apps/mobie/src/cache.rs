@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use directories::ProjectDirs;
+use mobie_models::Session;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -46,6 +47,15 @@ pub struct SyncWindowRecord {
     pub last_attempt_epoch_ms: Option<i64>,
     pub status: String,
     pub error_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub location_id: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub limit: usize,
+    pub oldest_first: bool,
 }
 
 #[cfg(test)]
@@ -164,6 +174,18 @@ impl CacheHandle {
         };
 
         store.get_sync_window(resource, scope, window_start, window_end)
+    }
+
+    pub fn read_sessions(
+        &self,
+        lookup: &CacheLookup,
+        query: &SessionQuery,
+    ) -> Result<Vec<Session>, String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        store.read_sessions(lookup, query)
     }
 }
 
@@ -415,6 +437,59 @@ impl CacheStore {
             )
             .optional()
             .map_err(|err| format!("failed to read sync window: {err}"))
+    }
+
+    fn read_sessions(
+        &self,
+        lookup: &CacheLookup,
+        query: &SessionQuery,
+    ) -> Result<Vec<Session>, String> {
+        let Some(user_email) = lookup.user_email.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(profile) = lookup.profile.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let order = if query.oldest_first { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT payload_json
+             FROM sessions
+             WHERE base_url = ?1
+               AND user_email = ?2
+               AND profile = ?3
+               AND location_id = ?4
+               AND (?5 IS NULL OR start_date_time >= ?5)
+               AND (?6 IS NULL OR start_date_time < ?6)
+             ORDER BY start_date_time {order}, session_id {order}
+             LIMIT ?7"
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| format!("failed to prepare session query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    lookup.base_url,
+                    user_email,
+                    profile,
+                    query.location_id,
+                    query.from,
+                    query.to,
+                    i64::try_from(query.limit).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| format!("failed to execute session query: {err}"))?;
+
+        rows.map(|row| {
+            let payload_json = row.map_err(|err| format!("failed to read session row: {err}"))?;
+            serde_json::from_str::<Session>(&payload_json)
+                .map_err(|err| format!("failed to decode cached session row: {err}"))
+        })
+        .collect()
     }
 
     fn get<T>(&mut self, lookup: &CacheLookup, spec: &CacheSpec) -> Result<Option<T>, String>
@@ -1450,5 +1525,70 @@ mod tests {
         assert_eq!(failed.last_success_epoch_ms, Some(1_000));
         assert_eq!(failed.last_attempt_epoch_ms, Some(2_000));
         assert_eq!(failed.error_json.as_deref(), Some("{\"kind\":\"timeout\"}"));
+    }
+
+    #[test]
+    fn read_sessions_filters_orders_and_limits_results() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let mut store = CacheStore::open_at(path).unwrap();
+        let lookup = CacheLookup {
+            base_url: "https://pgm.mobie.pt".to_string(),
+            user_email: Some("user@example.com".to_string()),
+            profile: Some("DPC".to_string()),
+        };
+
+        store
+            .put(
+                &lookup,
+                &CacheSpec {
+                    resource: "sessions",
+                    ttl: Duration::from_secs(60),
+                    params: vec![("location", "LOC-1".to_string())],
+                },
+                &vec![
+                    serde_json::json!({
+                        "id": "sess-3",
+                        "start_date_time": "2026-03-03T10:00:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-1"
+                    }),
+                    serde_json::json!({
+                        "id": "sess-2",
+                        "start_date_time": "2026-03-02T10:00:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-1"
+                    }),
+                    serde_json::json!({
+                        "id": "sess-1",
+                        "start_date_time": "2026-03-01T10:00:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-1"
+                    }),
+                    serde_json::json!({
+                        "id": "sess-other-location",
+                        "start_date_time": "2026-03-01T09:00:00Z",
+                        "status": "COMPLETED",
+                        "location_id": "LOC-2"
+                    }),
+                ],
+            )
+            .unwrap();
+
+        let sessions = store
+            .read_sessions(
+                &lookup,
+                &SessionQuery {
+                    location_id: "LOC-1".to_string(),
+                    from: Some("2026-03-01T00:00:00Z".to_string()),
+                    to: Some("2026-03-03T00:00:00Z".to_string()),
+                    limit: 2,
+                    oldest_first: true,
+                },
+            )
+            .unwrap();
+
+        let ids = sessions.into_iter().map(|session| session.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["sess-1", "sess-2"]);
     }
 }
