@@ -2042,6 +2042,8 @@ mod tests {
             email: None,
             password: None,
             json: true,
+            markdown: false,
+            toon: false,
             pretty: false,
             command,
         }
@@ -2157,6 +2159,8 @@ mod tests {
                 email: Some("user@example.com".into()),
                 password: Some("secret".into()),
                 json: true,
+                markdown: false,
+                toon: false,
                 pretty: false,
                 command: Command::Auth {
                     command: AuthCommand::Check,

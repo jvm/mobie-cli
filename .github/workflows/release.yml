@@ -1,0 +1,132 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Verify tag matches crate version
+        run: |
+          version="$(bash ./scripts/mobie-version.sh)"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match apps/mobie/Cargo.toml version v${version}" >&2
+            exit 1
+          fi
+
+  build-macos:
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package release archive
+        run: bash ./scripts/package-release.sh "${{ matrix.target }}" "${{ needs.verify-version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: mobie-v${{ needs.verify-version.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    needs:
+      - verify-version
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare release metadata
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          arm_archive="dist/aarch64-apple-darwin/mobie-v${VERSION}-aarch64-apple-darwin.tar.gz"
+          intel_archive="dist/x86_64-apple-darwin/mobie-v${VERSION}-x86_64-apple-darwin.tar.gz"
+
+          arm_sha="$(shasum -a 256 "${arm_archive}" | awk '{print $1}')"
+          intel_sha="$(shasum -a 256 "${intel_archive}" | awk '{print $1}')"
+
+          {
+            echo "VERSION=${VERSION}"
+            echo "ARM_ARCHIVE=${arm_archive}"
+            echo "INTEL_ARCHIVE=${intel_archive}"
+            echo "ARM_SHA=${arm_sha}"
+            echo "INTEL_SHA=${intel_sha}"
+            echo "ARM_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/mobie-v${VERSION}-aarch64-apple-darwin.tar.gz"
+            echo "INTEL_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/mobie-v${VERSION}-x86_64-apple-darwin.tar.gz"
+          } >> "${GITHUB_ENV}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" \
+            "${ARM_ARCHIVE}" \
+            "${INTEL_ARCHIVE}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "v${VERSION}" \
+            --notes "Homebrew release assets for mobie v${VERSION}."
+
+      - name: Dispatch tap update
+        env:
+          DISPATCH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "${DISPATCH_TOKEN}" ]]; then
+            echo "missing HOMEBREW_TAP_DISPATCH_TOKEN" >&2
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg version "${VERSION}" \
+            --arg arm_url "${ARM_URL}" \
+            --arg arm_sha "${ARM_SHA}" \
+            --arg intel_url "${INTEL_URL}" \
+            --arg intel_sha "${INTEL_SHA}" \
+            '{
+              event_type: "mobie_release",
+              client_payload: {
+                formula: "mobie",
+                version: $version,
+                macos_arm64: {
+                  url: $arm_url,
+                  sha256: $arm_sha
+                },
+                macos_amd64: {
+                  url: $intel_url,
+                  sha256: $intel_sha
+                }
+              }
+            }'
+          )"
+
+          curl --fail-with-body \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/jvm/homebrew-tap/dispatches \
+            -d "${payload}"

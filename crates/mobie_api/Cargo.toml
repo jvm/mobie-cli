@@ -3,6 +3,8 @@ name = "mobie_api"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
 mobie_models = { path = "../mobie_models" }

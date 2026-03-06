@@ -34,3 +34,15 @@ Specific expectations:
 - `--markdown` should preserve a document-friendly structure equivalent to the terminal view.
 - `--toon` should preserve the same response envelope semantics as `--json`, encoded as TOON.
 - Favor deterministic columns and ordering over clever formatting.
+
+## Release Workflow
+
+- Homebrew releases are driven by Git tags in `jvm/mobie-cli`.
+- The release version source of truth is `apps/mobie/Cargo.toml`.
+- Release tags must match that version exactly, using the `vX.Y.Z` format.
+- Pushing a matching tag triggers `.github/workflows/release.yml`.
+- That workflow builds macOS `aarch64-apple-darwin` and `x86_64-apple-darwin` archives, creates the GitHub release, and dispatches the asset metadata to `jvm/homebrew-tap`.
+- The helper scripts for that flow are `scripts/mobie-version.sh` and `scripts/package-release.sh`.
+- `jvm/homebrew-tap` listens for the `mobie_release` repository dispatch event and regenerates `Formula/mobie.rb`.
+- `HOMEBREW_TAP_DISPATCH_TOKEN` must exist in the `jvm/mobie-cli` repository secrets for the dispatch step to work.
+- When changing release packaging, keep the archive naming stable: `mobie-v<version>-<target>.tar.gz`.

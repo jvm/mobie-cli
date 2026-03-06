@@ -12,6 +12,22 @@ Standalone Rust CLI for querying the reverse-engineered MOBIE API.
 cargo build
 ```
 
+## Install With Homebrew
+
+After the first tagged GitHub release is published, install from the tap:
+
+```bash
+brew tap jvm/tap
+brew install mobie
+```
+
+Upgrade later with:
+
+```bash
+brew update
+brew upgrade mobie
+```
+
 ## Configure
 
 Required for authenticated commands:
@@ -96,3 +112,24 @@ cargo run -p mobie -- --json sessions list --location MOBI-XXX-00000
 ```
 
 `sessions list --from/--to` maps to the MOBIE API's `dateFrom` / `dateTo` query params. Date-only values include the full day.
+
+## Release Flow
+
+Homebrew releases are driven by Git tags:
+
+1. Update `apps/mobie/Cargo.toml` to the release version.
+2. Commit the change and push it.
+3. Create and push a matching tag like `v0.2.0`.
+
+That tag triggers GitHub Actions to:
+
+- build macOS Apple Silicon and Intel release archives
+- create a GitHub release in `jvm/mobie-cli`
+- dispatch release metadata to `jvm/homebrew-tap`
+- update `Formula/mobie.rb` in the tap with the new asset URLs and SHA-256 values
+
+Required repository secrets:
+
+- In `jvm/mobie-cli`: `HOMEBREW_TAP_DISPATCH_TOKEN`
+
+The token only needs permission to dispatch workflows to `jvm/homebrew-tap` and push commits there.

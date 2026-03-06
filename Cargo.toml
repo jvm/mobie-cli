@@ -9,6 +9,8 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "ISC"
+homepage = "https://github.com/jvm/mobie-cli"
+repository = "https://github.com/jvm/mobie-cli"
 
 [workspace.dependencies]
 anyhow = "1.0.95"
