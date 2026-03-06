@@ -1,5 +1,5 @@
 use mobie_api::{AccessContext, MobieClient, SessionFilters};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, query_param, AnyMatcher};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -8,36 +8,8 @@ async fn paginates_sessions_until_empty_page() {
 
     Mock::given(method("GET"))
         .and(path("/api/sessions"))
-        .and(query_param("limit", "2"))
+        .and(query_param("locationId", "EVSE-1"))
         .and(query_param("offset", "0"))
-        .and(query_param("locationId", "EVSE-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": [
-                {
-                    "id": "sess-1",
-                    "start_date_time": "2025-01-01T00:00:00Z",
-                    "end_date_time": "2025-01-01T01:00:00Z",
-                    "location_id": "EVSE-1"
-                },
-                {
-                    "id": "sess-2",
-                    "start_date_time": "2025-01-02T00:00:00Z",
-                    "end_date_time": "2025-01-02T01:00:00Z",
-                    "location_id": "EVSE-1"
-                }
-            ],
-            "status_code": 1000,
-            "status_message": "Success",
-            "timestamp": "2025-01-01T00:00:00Z"
-        })))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/api/sessions"))
-        .and(query_param("limit", "2"))
-        .and(query_param("offset", "2"))
-        .and(query_param("locationId", "EVSE-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
                 {
@@ -45,6 +17,18 @@ async fn paginates_sessions_until_empty_page() {
                     "start_date_time": "2025-01-03T00:00:00Z",
                     "end_date_time": "2025-01-03T01:00:00Z",
                     "location_id": "EVSE-1"
+                },
+                {
+                    "id": "sess-2",
+                    "start_date_time": "2025-01-02T00:00:00Z",
+                    "end_date_time": "2025-01-02T01:00:00Z",
+                    "location_id": "EVSE-1"
+                },
+                {
+                    "id": "sess-1",
+                    "start_date_time": "2025-01-01T00:00:00Z",
+                    "end_date_time": "2025-01-01T01:00:00Z",
+                    "location_id": "EVSE-1"
                 }
             ],
             "status_code": 1000,
@@ -56,9 +40,8 @@ async fn paginates_sessions_until_empty_page() {
 
     Mock::given(method("GET"))
         .and(path("/api/sessions"))
-        .and(query_param("limit", "2"))
-        .and(query_param("offset", "3"))
         .and(query_param("locationId", "EVSE-1"))
+        .and(query_param("offset", "3"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [],
             "status_code": 1000,
@@ -78,7 +61,7 @@ async fn paginates_sessions_until_empty_page() {
             expires_at_epoch_ms: None,
         });
 
-    let sessions = client.list_sessions_paginated("EVSE-1", 2).await.unwrap();
+    let sessions = client.list_sessions_paginated("EVSE-1", 3).await.unwrap();
     assert_eq!(sessions.len(), 3);
     assert_eq!(sessions[0].id, "sess-1");
     assert_eq!(sessions[2].id, "sess-3");

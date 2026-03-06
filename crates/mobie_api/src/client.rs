@@ -333,18 +333,19 @@ impl MobieClient {
         limit: i64,
         filters: &SessionFilters,
     ) -> Result<Vec<Session>, MobieApiError> {
-        let mut limit = clamp_limit(limit);
+        let target_count = limit as usize;
+        let mut page_limit = clamp_limit(limit);
         let mut out = Vec::new();
         let mut offset: i64 = 0;
         loop {
             let page = match self
-                .list_sessions_page_filtered(location_id, limit, offset, filters)
+                .list_sessions_page_filtered(location_id, page_limit, offset, filters)
                 .await
             {
                 Ok(page) => page,
                 Err(err) => {
-                    if limit > 50 {
-                        limit = 50;
+                    if page_limit > 50 {
+                        page_limit = 50;
                         continue;
                     }
                     return Err(err);
@@ -355,7 +356,15 @@ impl MobieClient {
             }
             offset += page.len() as i64;
             out.extend(page);
+
+            // Stop if we've collected enough items to satisfy the limit
+            if out.len() >= target_count {
+                out.truncate(target_count);
+                break;
+            }
         }
+        // Reverse the entire result to show oldest first (top) and newest last (bottom)
+        out.reverse();
         Ok(out)
     }
 
@@ -426,20 +435,28 @@ impl MobieClient {
         limit: i64,
         error_only: bool,
     ) -> Result<Vec<OcppLogEntry>, MobieApiError> {
-        self.collect_paginated(limit, |client, page_limit, offset| {
-            Box::pin(client.list_ocpp_logs_page(page_limit, offset, error_only))
-        })
-        .await
+        let mut logs = self
+            .collect_paginated(limit, |client, page_limit, offset| {
+                Box::pin(client.list_ocpp_logs_page(page_limit, offset, error_only))
+            })
+            .await?;
+        // Reverse to show oldest first (top) and newest last (bottom)
+        logs.reverse();
+        Ok(logs)
     }
 
     pub async fn list_ocpi_logs_paginated(
         &mut self,
         limit: i64,
     ) -> Result<Vec<Value>, MobieApiError> {
-        self.collect_paginated(limit, |client, page_limit, offset| {
-            Box::pin(client.list_ocpi_logs_page(page_limit, offset))
-        })
-        .await
+        let mut logs = self
+            .collect_paginated(limit, |client, page_limit, offset| {
+                Box::pin(client.list_ocpi_logs_page(page_limit, offset))
+            })
+            .await?;
+        // Reverse to show oldest first (top) and newest last (bottom)
+        logs.reverse();
+        Ok(logs)
     }
 
     pub async fn get_entity(&mut self, entity_code: &str) -> Result<Value, MobieApiError> {
@@ -529,6 +546,7 @@ impl MobieClient {
             Box<dyn std::future::Future<Output = Result<Vec<T>, MobieApiError>> + 'a>,
         >,
     {
+        let target_count = limit as usize;
         let mut page_limit = clamp_limit(limit);
         let mut offset = 0_i64;
         let mut all_items = Vec::new();
@@ -549,6 +567,12 @@ impl MobieClient {
 
             offset += page.len() as i64;
             all_items.extend(page);
+
+            // Stop if we've collected enough items to satisfy the limit
+            if all_items.len() >= target_count {
+                all_items.truncate(target_count);
+                break;
+            }
         }
 
         Ok(all_items)

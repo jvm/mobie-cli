@@ -130,19 +130,19 @@ async fn sessions_list_json_collects_all_pages() {
             "data": [
                 {
                     "id": "sess-1",
-                    "start_date_time": "2025-01-01T10:00:00Z",
-                    "end_date_time": "2025-01-01T11:00:00Z",
-                    "status": "COMPLETED",
-                    "kwh": 10.5,
-                    "cdr_token": {"uid": "token-1"}
-                },
-                {
-                    "id": "sess-2",
                     "start_date_time": "2025-01-02T10:00:00Z",
                     "end_date_time": "2025-01-02T11:00:00Z",
                     "status": "COMPLETED",
                     "kwh": 9.0,
                     "cdr_token": {"uid": "token-2"}
+                },
+                {
+                    "id": "sess-2",
+                    "start_date_time": "2025-01-01T10:00:00Z",
+                    "end_date_time": "2025-01-01T11:00:00Z",
+                    "status": "COMPLETED",
+                    "kwh": 10.5,
+                    "cdr_token": {"uid": "token-1"}
                 }
             ],
             "status_code": 1000,
@@ -176,7 +176,9 @@ async fn sessions_list_json_collects_all_pages() {
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(body["resource"], "sessions");
     assert_eq!(body["meta"]["count"], 2);
-    assert_eq!(body["data"][1]["id"], "sess-2");
+    // With oldest-first ordering, sess-2 (Jan 1) comes before sess-1 (Jan 2)
+    assert_eq!(body["data"][0]["id"], "sess-2");
+    assert_eq!(body["data"][1]["id"], "sess-1");
 }
 
 #[tokio::test]
@@ -194,18 +196,18 @@ async fn sessions_list_json_sends_api_date_filters() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
                 {
-                    "id": "sess-server-overlap",
-                    "start_date_time": "2025-01-01T23:30:00Z",
-                    "end_date_time": "2025-01-02T00:30:00Z",
-                    "status": "COMPLETED",
-                    "kwh": 5.0
-                },
-                {
                     "id": "sess-inside",
                     "start_date_time": "2025-01-02T10:00:00Z",
                     "end_date_time": "2025-01-02T11:00:00Z",
                     "status": "COMPLETED",
                     "kwh": 7.0
+                },
+                {
+                    "id": "sess-server-overlap",
+                    "start_date_time": "2025-01-01T23:30:00Z",
+                    "end_date_time": "2025-01-02T00:30:00Z",
+                    "status": "COMPLETED",
+                    "kwh": 5.0
                 },
             ],
             "status_code": 1000,
