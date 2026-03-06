@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration as StdDuration;
 
-use cache::{CacheHandle, CacheLookup, CacheSpec};
+use cache::{CacheHandle, CacheLookup, CacheSpec, SessionQuery as CacheSessionQuery};
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, SessionFilters};
@@ -19,6 +19,10 @@ use thiserror::Error;
 
 const ORDERING_CACHE_VERSION: &str = "oldest-first-v1";
 const SESSION_RECENT_LOOKBACK_DAYS: i64 = 3;
+
+fn current_epoch_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,26 +587,76 @@ async fn execute_cached_session_command<S: SessionStore>(
             let location = location.clone();
             let limit = *limit;
             let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
-            Ok(Output::Sessions(
-                cached_fetch(
-                    cli,
-                    store,
-                    cache,
-                    CacheSpec {
+            let plan = session_query_plan(&location, limit, &filters, Utc::now());
+            let mut lookup = cache_lookup(cli, store)?;
+            cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
+
+            let needs_refresh = match (
+                lookup.user_email.as_deref(),
+                lookup.profile.as_deref(),
+                cache.get_sync_window(
+                    "sessions",
+                    &plan.scope,
+                    Some(&plan.refresh.window_start),
+                    Some(&plan.refresh.window_end),
+                ),
+            ) {
+                (Some(_), Some(_), Ok(Some(window))) => {
+                    !window.is_fresh_at(current_epoch_ms(), sessions_ttl())
+                }
+                _ => true,
+            };
+
+            if needs_refresh {
+                let mut authed = resolve_authenticated_client(cli, store).await?;
+                let data = authed
+                    .client
+                    .sync_sessions_window(&location, limit, &filters)
+                    .await?;
+                persist_session_if_needed(store, cli, &authed)?;
+
+                if let Some(access) = authed.client.access_context() {
+                    lookup = CacheLookup {
+                        base_url: canonical_base_url(&cli.base_url),
+                        user_email: Some(access.user_email.clone()),
+                        profile: Some(access.profile.clone()),
+                    };
+                    let spec = CacheSpec {
                         resource: "sessions",
                         ttl: sessions_ttl(),
                         params: session_cache_params(&location, limit, &filters),
-                    },
-                    move |client| {
-                        Box::pin(async move {
-                            client
-                                .list_sessions_paginated_filtered(&location, limit, &filters)
-                                .await
-                                .map_err(AppError::from)
-                        })
-                    },
-                )
-                .await?,
+                    };
+                    if let Err(err) = cache.put(&lookup, &spec, &data) {
+                        cache_warn(cli, cache, &err);
+                    }
+                    if let Err(err) = cache.record_sync_success(
+                        "sessions",
+                        &plan.scope,
+                        Some(&plan.refresh.window_start),
+                        Some(&plan.refresh.window_end),
+                        current_epoch_ms(),
+                    ) {
+                        cache_warn(cli, cache, &err);
+                    }
+                }
+            }
+
+            Ok(Output::Sessions(
+                cache
+                    .read_sessions(
+                        &lookup,
+                        &CacheSessionQuery {
+                            location_id: plan.query.location_id,
+                            from: plan.query.date_from,
+                            to: plan.query.date_to,
+                            limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
+                            oldest_first: matches!(
+                                plan.query.order,
+                                SessionQueryOrder::OldestFirst
+                            ),
+                        },
+                    )
+                    .map_err(AppError::InvalidInput)?,
             ))
         }
     }
