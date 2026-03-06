@@ -36,6 +36,18 @@ pub struct CacheEntryMeta {
     pub expires_at_epoch_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncWindowRecord {
+    pub resource: String,
+    pub scope: String,
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub last_success_epoch_ms: Option<i64>,
+    pub last_attempt_epoch_ms: Option<i64>,
+    pub status: String,
+    pub error_json: Option<String>,
+}
+
 #[cfg(test)]
 impl CacheEntryMeta {
     pub fn is_stale_at(&self, now_epoch_ms: i64) -> bool {
@@ -100,6 +112,68 @@ impl CacheHandle {
                 self.warned_unavailable = true;
             }
         }
+    }
+
+    pub fn record_sync_success(
+        &mut self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+        at_epoch_ms: i64,
+    ) -> Result<(), String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+
+        store.record_sync_success(resource, scope, window_start, window_end, at_epoch_ms)
+    }
+
+    pub fn record_sync_failure(
+        &mut self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+        at_epoch_ms: i64,
+        error_json: &str,
+    ) -> Result<(), String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+
+        store.record_sync_failure(
+            resource,
+            scope,
+            window_start,
+            window_end,
+            at_epoch_ms,
+            error_json,
+        )
+    }
+
+    pub fn get_sync_window(
+        &self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+    ) -> Result<Option<SyncWindowRecord>, String> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+
+        store.get_sync_window(resource, scope, window_start, window_end)
+    }
+}
+
+impl SyncWindowRecord {
+    pub fn is_fresh_at(&self, now_epoch_ms: i64, max_age: Duration) -> bool {
+        let Some(last_success_epoch_ms) = self.last_success_epoch_ms else {
+            return false;
+        };
+        let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        now_epoch_ms.saturating_sub(last_success_epoch_ms) <= max_age_ms
     }
 }
 
@@ -236,6 +310,13 @@ impl CacheStore {
              CREATE INDEX IF NOT EXISTS idx_json_resources_scope ON json_resources(scope);",
         )
         .map_err(|err| format!("failed to initialize cache schema: {err}"))?;
+        ensure_column_exists(&conn, "ocpp_logs", "fingerprint", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column_exists(&conn, "ocpp_logs", "sort_key", "TEXT NOT NULL DEFAULT ''")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_ocpp_logs_scope_sort_key ON ocpp_logs(scope, sort_key);
+             CREATE INDEX IF NOT EXISTS idx_ocpp_logs_fingerprint ON ocpp_logs(fingerprint);",
+        )
+        .map_err(|err| format!("failed to initialize ocpp_logs indexes: {err}"))?;
 
         let schema_value = serde_json::json!({
             "version": CACHE_SCHEMA_VERSION,
@@ -250,6 +331,90 @@ impl CacheStore {
         .map_err(|err| format!("failed to record cache schema version: {err}"))?;
 
         Ok(Self { conn })
+    }
+
+    fn record_sync_success(
+        &self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+        at_epoch_ms: i64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO sync_windows (
+                    resource, scope, window_start, window_end,
+                    last_success_epoch_ms, last_attempt_epoch_ms, status, error_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'success', NULL)
+                 ON CONFLICT(resource, scope, window_start, window_end) DO UPDATE SET
+                    last_success_epoch_ms = excluded.last_success_epoch_ms,
+                    last_attempt_epoch_ms = excluded.last_attempt_epoch_ms,
+                    status = excluded.status,
+                    error_json = excluded.error_json",
+                params![resource, scope, window_start, window_end, at_epoch_ms],
+            )
+            .map_err(|err| format!("failed to record sync success: {err}"))?;
+        Ok(())
+    }
+
+    fn record_sync_failure(
+        &self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+        at_epoch_ms: i64,
+        error_json: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO sync_windows (
+                    resource, scope, window_start, window_end,
+                    last_success_epoch_ms, last_attempt_epoch_ms, status, error_json
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'error', ?6)
+                 ON CONFLICT(resource, scope, window_start, window_end) DO UPDATE SET
+                    last_attempt_epoch_ms = excluded.last_attempt_epoch_ms,
+                    status = excluded.status,
+                    error_json = excluded.error_json",
+                params![resource, scope, window_start, window_end, at_epoch_ms, error_json],
+            )
+            .map_err(|err| format!("failed to record sync failure: {err}"))?;
+        Ok(())
+    }
+
+    fn get_sync_window(
+        &self,
+        resource: &str,
+        scope: &str,
+        window_start: Option<&str>,
+        window_end: Option<&str>,
+    ) -> Result<Option<SyncWindowRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT resource, scope, window_start, window_end,
+                        last_success_epoch_ms, last_attempt_epoch_ms, status, error_json
+                 FROM sync_windows
+                 WHERE resource = ?1
+                   AND scope = ?2
+                   AND window_start IS ?3
+                   AND window_end IS ?4",
+                params![resource, scope, window_start, window_end],
+                |row| {
+                    Ok(SyncWindowRecord {
+                        resource: row.get(0)?,
+                        scope: row.get(1)?,
+                        window_start: row.get(2)?,
+                        window_end: row.get(3)?,
+                        last_success_epoch_ms: row.get(4)?,
+                        last_attempt_epoch_ms: row.get(5)?,
+                        status: row.get(6)?,
+                        error_json: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| format!("failed to read sync window: {err}"))
     }
 
     fn get<T>(&mut self, lookup: &CacheLookup, spec: &CacheSpec) -> Result<Option<T>, String>
@@ -726,19 +891,16 @@ fn sync_ocpp_logs(
     for (index, item) in items.iter().enumerate() {
         let log_id = item.get("id").and_then(json_scalar_to_string);
         let timestamp = item.get("timestamp").and_then(json_scalar_to_string);
-        let log_key = log_id
-            .clone()
-            .or_else(|| timestamp.clone())
-            .map(|base| format!("{base}:{index}"))
-            .unwrap_or_else(|| format!("scope:{scope}:index:{index}"));
+        let fingerprint = ocpp_log_fingerprint(item)?;
+        let sort_key = ocpp_log_sort_key(timestamp.as_deref(), index);
         let payload_json = serde_json::to_string(item)
             .map_err(|err| format!("failed to serialize log row: {err}"))?;
 
         tx.execute(
             "INSERT INTO ocpp_logs (
                 base_url, user_email, profile, log_key, scope, payload_json, fetched_at, expires_at,
-                log_id, timestamp, message_type, direction
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                log_id, timestamp, message_type, direction, fingerprint, sort_key
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(base_url, user_email, profile, log_key) DO UPDATE SET
                 scope = excluded.scope,
                 payload_json = excluded.payload_json,
@@ -747,20 +909,24 @@ fn sync_ocpp_logs(
                 log_id = excluded.log_id,
                 timestamp = excluded.timestamp,
                 message_type = excluded.message_type,
-                direction = excluded.direction",
+                direction = excluded.direction,
+                fingerprint = excluded.fingerprint,
+                sort_key = excluded.sort_key",
             params![
                 base_url,
                 user_email,
                 profile,
-                log_key,
+                fingerprint,
                 scope,
                 payload_json,
                 fetched_at_epoch_ms,
                 expires_at_epoch_ms,
                 log_id,
                 timestamp,
-                item.get("message_type").and_then(json_scalar_to_string),
-                item.get("direction").and_then(json_scalar_to_string)
+                ocpp_log_field(item, &["message_type", "messageType"]),
+                item.get("direction").and_then(json_scalar_to_string),
+                fingerprint,
+                sort_key
             ],
         )
         .map_err(|err| format!("failed to upsert log row: {err}"))?;
@@ -812,6 +978,56 @@ fn json_scalar_to_string(value: &Value) -> Option<String> {
         Value::Bool(v) => Some(v.to_string()),
         _ => None,
     }
+}
+
+fn ocpp_log_field(item: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(json_scalar_to_string))
+}
+
+fn ocpp_log_fingerprint(item: &Value) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({
+        "id": item.get("id").and_then(json_scalar_to_string),
+        "timestamp": item.get("timestamp").and_then(json_scalar_to_string),
+        "direction": item.get("direction").and_then(json_scalar_to_string),
+        "message_type": ocpp_log_field(item, &["message_type", "messageType"]),
+        "payload": item
+            .get("logs")
+            .cloned()
+            .or_else(|| item.get("payload").cloned())
+            .unwrap_or(Value::Null),
+    }))
+    .map_err(|err| format!("failed to encode ocpp log fingerprint: {err}"))
+}
+
+fn ocpp_log_sort_key(timestamp: Option<&str>, ordinal: usize) -> String {
+    let timestamp = timestamp.unwrap_or("unknown-timestamp");
+    format!("{timestamp}#{ordinal:08}")
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .map_err(|err| format!("failed to inspect table {table}: {err}"))?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| format!("failed to inspect columns for {table}: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("failed to inspect columns for {table}: {err}"))?;
+    if existing.iter().any(|name| name == column) {
+        return Ok(());
+    }
+
+    let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    conn.execute(&statement, [])
+        .map_err(|err| format!("failed to add column {column} to {table}: {err}"))?;
+    Ok(())
 }
 
 fn normalize_params(params: &[(&'static str, String)]) -> BTreeMap<&'static str, String> {
@@ -1100,5 +1316,139 @@ mod tests {
         assert_eq!(locations, 1);
         assert_eq!(sessions, 1);
         assert_eq!(token_uid, "token-1");
+    }
+
+    #[test]
+    fn ocpp_log_fingerprint_changes_when_direction_or_payload_changes() {
+        let request = serde_json::json!({
+            "id": "MOBI-LSB-00693",
+            "messageType": "Heartbeat",
+            "direction": "Request",
+            "timestamp": "2026-03-06T19:45:53.176Z",
+            "logs": "2026-03-06T19:45:53.176Z"
+        });
+        let same_request = request.clone();
+        let response = serde_json::json!({
+            "id": "MOBI-LSB-00693",
+            "messageType": "Heartbeat",
+            "direction": "Response",
+            "timestamp": "2026-03-06T19:45:53.176Z",
+            "logs": "{\"currentTime\":\"2026-03-06T19:45:53.176Z\"}"
+        });
+
+        let request_fingerprint = ocpp_log_fingerprint(&request).unwrap();
+        let same_request_fingerprint = ocpp_log_fingerprint(&same_request).unwrap();
+        let response_fingerprint = ocpp_log_fingerprint(&response).unwrap();
+
+        assert_eq!(request_fingerprint, same_request_fingerprint);
+        assert_ne!(request_fingerprint, response_fingerprint);
+    }
+
+    #[test]
+    fn ocpp_log_sort_key_is_deterministic() {
+        let first = ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 0);
+        let second = ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 1);
+
+        assert_eq!(first, "2026-03-06T19:45:53.176Z#00000000");
+        assert_eq!(second, "2026-03-06T19:45:53.176Z#00000001");
+        assert!(first < second);
+    }
+
+    #[test]
+    fn ocpp_logs_are_deduped_by_fingerprint() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let mut store = CacheStore::open_at(path).unwrap();
+        let lookup = CacheLookup {
+            base_url: "https://pgm.mobie.pt".to_string(),
+            user_email: Some("user@example.com".to_string()),
+            profile: Some("DPC".to_string()),
+        };
+        let spec = CacheSpec {
+            resource: "logs",
+            ttl: Duration::from_secs(60),
+            params: vec![("limit", "10".to_string())],
+        };
+        let repeated = serde_json::json!({
+            "id": "MOBI-LSB-00693",
+            "messageType": "Heartbeat",
+            "direction": "Request",
+            "timestamp": "2026-03-06T19:45:53.176Z",
+            "logs": "2026-03-06T19:45:53.176Z"
+        });
+
+        store
+            .put(&lookup, &spec, &vec![repeated.clone(), repeated.clone()])
+            .unwrap();
+
+        let rows: Vec<(String, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT fingerprint, sort_key FROM ocpp_logs ORDER BY sort_key")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, ocpp_log_fingerprint(&repeated).unwrap());
+        assert_eq!(rows[0].1, ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 0));
+    }
+
+    #[test]
+    fn sync_windows_round_trip_and_report_freshness() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cache.db");
+        let store = CacheStore::open_at(path).unwrap();
+
+        store
+            .record_sync_success(
+                "sessions",
+                "location:MOBI-LSB-00693",
+                Some("2026-03-01T00:00:00Z"),
+                Some("2026-03-07T00:00:00Z"),
+                1_000,
+            )
+            .unwrap();
+        let success = store
+            .get_sync_window(
+                "sessions",
+                "location:MOBI-LSB-00693",
+                Some("2026-03-01T00:00:00Z"),
+                Some("2026-03-07T00:00:00Z"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(success.status, "success");
+        assert_eq!(success.last_success_epoch_ms, Some(1_000));
+        assert!(success.error_json.is_none());
+        assert!(success.is_fresh_at(1_500, Duration::from_millis(600)));
+        assert!(!success.is_fresh_at(1_700, Duration::from_millis(600)));
+
+        store
+            .record_sync_failure(
+                "sessions",
+                "location:MOBI-LSB-00693",
+                Some("2026-03-01T00:00:00Z"),
+                Some("2026-03-07T00:00:00Z"),
+                2_000,
+                "{\"kind\":\"timeout\"}",
+            )
+            .unwrap();
+        let failed = store
+            .get_sync_window(
+                "sessions",
+                "location:MOBI-LSB-00693",
+                Some("2026-03-01T00:00:00Z"),
+                Some("2026-03-07T00:00:00Z"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.last_success_epoch_ms, Some(1_000));
+        assert_eq!(failed.last_attempt_epoch_ms, Some(2_000));
+        assert_eq!(failed.error_json.as_deref(), Some("{\"kind\":\"timeout\"}"));
     }
 }

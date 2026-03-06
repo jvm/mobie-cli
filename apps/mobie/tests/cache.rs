@@ -137,6 +137,22 @@ async fn schema_contains_cache_meta_and_sync_windows() {
             "expected table {expected} to exist, tables were {table_names:?}"
         );
     }
+
+    let mut columns_stmt = conn
+        .prepare("PRAGMA table_info(ocpp_logs)")
+        .unwrap();
+    let columns = columns_stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    for expected in ["payload_json", "fetched_at", "expires_at", "fingerprint", "sort_key"] {
+        assert!(
+            columns.iter().any(|column| column == expected),
+            "expected ocpp_logs column {expected} to exist, columns were {columns:?}"
+        );
+    }
 }
 
 #[tokio::test]
