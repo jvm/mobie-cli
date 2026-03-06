@@ -17,6 +17,8 @@ use serde_json::Value;
 use session_store::{KeyringSessionStore, SessionStore, StoredSession};
 use thiserror::Error;
 
+const ORDERING_CACHE_VERSION: &str = "oldest-first-v1";
+
 #[derive(Debug, Parser)]
 #[command(name = "mobie", version)]
 struct Cli {
@@ -549,18 +551,7 @@ async fn execute_cached_session_command<S: SessionStore>(
                     CacheSpec {
                         resource: "sessions",
                         ttl: sessions_ttl(),
-                        params: vec![
-                            ("location", location.clone()),
-                            ("limit", limit.to_string()),
-                            (
-                                "from",
-                                filters.date_from.clone().unwrap_or_else(|| "-".to_string()),
-                            ),
-                            (
-                                "to",
-                                filters.date_to.clone().unwrap_or_else(|| "-".to_string()),
-                            ),
-                        ],
+                        params: session_cache_params(&location, limit, &filters),
                     },
                     move |client| {
                         Box::pin(async move {
@@ -629,10 +620,7 @@ async fn execute_cached_log_command<S: SessionStore>(
                     CacheSpec {
                         resource: "logs",
                         ttl: logs_ttl(),
-                        params: vec![
-                            ("limit", limit.to_string()),
-                            ("error_only", error_only.to_string()),
-                        ],
+                        params: ocpp_log_cache_params(limit, error_only),
                     },
                     move |client| {
                         Box::pin(async move {
@@ -657,7 +645,7 @@ async fn execute_cached_log_command<S: SessionStore>(
                     CacheSpec {
                         resource: "ocpi_logs",
                         ttl: logs_ttl(),
-                        params: vec![("limit", limit.to_string())],
+                        params: ocpi_log_cache_params(limit),
                     },
                     move |client| {
                         Box::pin(async move {
@@ -876,6 +864,41 @@ fn tokens_ttl() -> StdDuration {
 
 fn logs_ttl() -> StdDuration {
     StdDuration::from_secs(60 * 15)
+}
+
+fn session_cache_params(
+    location: &str,
+    limit: i64,
+    filters: &SessionFilters,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("location", location.to_string()),
+        ("limit", limit.to_string()),
+        ("order", ORDERING_CACHE_VERSION.to_string()),
+        (
+            "from",
+            filters.date_from.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "to",
+            filters.date_to.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+    ]
+}
+
+fn ocpp_log_cache_params(limit: i64, error_only: bool) -> Vec<(&'static str, String)> {
+    vec![
+        ("limit", limit.to_string()),
+        ("order", ORDERING_CACHE_VERSION.to_string()),
+        ("error_only", error_only.to_string()),
+    ]
+}
+
+fn ocpi_log_cache_params(limit: i64) -> Vec<(&'static str, String)> {
+    vec![
+        ("limit", limit.to_string()),
+        ("order", ORDERING_CACHE_VERSION.to_string()),
+    ]
 }
 
 async fn login_with_cli_credentials(
@@ -2589,5 +2612,32 @@ mod tests {
         let persisted = store.load(&server.uri()).unwrap().unwrap();
         assert_eq!(persisted.access.access_token, "new-token");
         assert_eq!(persisted.access.refresh_token.as_deref(), Some("refresh-2"));
+    }
+
+    #[test]
+    fn session_cache_params_include_ordering_version() {
+        let filters = SessionFilters {
+            date_from: Some("2025-01-01T00:00:00.000Z".into()),
+            date_to: Some("2025-01-02T00:00:00.000Z".into()),
+        };
+
+        let params = session_cache_params("EVSE-1", 50, &filters);
+
+        assert!(params.iter().any(|(key, value)| {
+            *key == "order" && value == ORDERING_CACHE_VERSION
+        }));
+    }
+
+    #[test]
+    fn log_cache_params_include_ordering_version() {
+        let ocpp_params = ocpp_log_cache_params(25, true);
+        let ocpi_params = ocpi_log_cache_params(25);
+
+        assert!(ocpp_params.iter().any(|(key, value)| {
+            *key == "order" && value == ORDERING_CACHE_VERSION
+        }));
+        assert!(ocpi_params.iter().any(|(key, value)| {
+            *key == "order" && value == ORDERING_CACHE_VERSION
+        }));
     }
 }
