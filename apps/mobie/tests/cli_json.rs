@@ -41,13 +41,12 @@ async fn auth_check_json_returns_safe_fields_only() {
     mock_login(&server).await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "auth",
             "check",
@@ -69,13 +68,12 @@ async fn auth_check_json_returns_safe_fields_only() {
 #[test]
 fn rejects_insecure_non_loopback_base_url() {
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             "http://example.com",
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "auth",
             "check",
@@ -117,13 +115,12 @@ async fn locations_list_json_returns_envelope_and_count() {
         .await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "locations",
             "list",
@@ -155,13 +152,12 @@ async fn json_errors_are_structured_and_sanitized() {
         .await;
 
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "auth",
             "check",
@@ -173,12 +169,7 @@ async fn json_errors_are_structured_and_sanitized() {
     let value: Value = serde_json::from_slice(&stderr).unwrap();
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["kind"], "login_failed");
-    assert!(
-        value["error"]["body"]
-            .as_str()
-            .unwrap()
-            .contains("[REDACTED]")
-    );
+    assert!(value["error"]["body"].is_null());
     assert!(!String::from_utf8_lossy(&stderr).contains("leaky-token"));
     assert!(!String::from_utf8_lossy(&stderr).contains("super-secret"));
 }
@@ -189,13 +180,12 @@ async fn invalid_session_range_is_reported_as_structured_json() {
     mock_login(&server).await;
 
     let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "sessions",
             "list",
@@ -242,13 +232,12 @@ async fn entity_get_json_returns_single_object() {
         .await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "entities",
             "get",
@@ -287,13 +276,12 @@ async fn location_analytics_json_returns_object() {
         .await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "locations",
             "analytics",
@@ -328,13 +316,12 @@ async fn ords_list_json_returns_array() {
         .await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "ords",
             "list",
@@ -385,13 +372,12 @@ async fn logs_ocpi_json_returns_array() {
         .await;
 
     let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_PASSWORD", "password")
         .args([
             "--base-url",
             server.uri().as_str(),
             "--email",
             "user@example.com",
-            "--password",
-            "password",
             "--json",
             "logs",
             "ocpi",
@@ -408,4 +394,33 @@ async fn logs_ocpi_json_returns_array() {
     assert_eq!(value["resource"], "ocpi_logs");
     assert_eq!(value["meta"]["count"], 1);
     assert_eq!(value["data"][0]["id"], "log-1");
+}
+
+#[test]
+fn rejects_password_passed_on_argv() {
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .args([
+            "--base-url",
+            "https://pgm.mobie.pt",
+            "--email",
+            "user@example.com",
+            "--password",
+            "password",
+            "--json",
+            "auth",
+            "check",
+        ])
+        .assert()
+        .failure();
+
+    let stderr = assert.get_output().stderr.clone();
+    let value: Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["kind"], "invalid_input");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing --password")
+    );
 }

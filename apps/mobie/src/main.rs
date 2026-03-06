@@ -23,7 +23,7 @@ struct Cli {
     #[arg(long, env = "MOBIE_EMAIL", hide_env_values = true)]
     email: Option<String>,
 
-    /// MOBIE account password. Can also be injected with dotenvx via MOBIE_PASSWORD.
+    /// MOBIE account password from MOBIE_PASSWORD or dotenvx. Passing --password is rejected.
     #[arg(long, env = "MOBIE_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
@@ -292,6 +292,20 @@ impl AuthResponse {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let store = KeyringSessionStore;
+
+    if password_supplied_via_argv() {
+        render_error(
+            &cli,
+            &ErrorPayload {
+                kind: "invalid_input",
+                message: "refusing --password on the command line; use MOBIE_PASSWORD, dotenvx, or the interactive prompt".into(),
+                status: None,
+                url: None,
+                body: None,
+            },
+        );
+        return ExitCode::from(1);
+    }
 
     match execute_with_store(&cli, &store).await {
         Ok(output) => match render_output(&cli, &output) {
@@ -610,6 +624,13 @@ async fn login_with_cli_credentials(
 
 fn has_explicit_credentials(cli: &Cli) -> bool {
     cli.email.is_some() || cli.password.is_some()
+}
+
+fn password_supplied_via_argv() -> bool {
+    std::env::args_os().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--password" || arg.starts_with("--password=")
+    })
 }
 
 fn collect_login_credentials(cli: &Cli) -> Result<(String, String), AppError> {
@@ -1930,42 +1951,40 @@ fn error_payload(err: &AppError) -> ErrorPayload<'_> {
                 url: None,
                 body: None,
             },
-            MobieApiError::LoginFailed { status, url, body } => ErrorPayload {
+            MobieApiError::LoginFailed { status, url, .. } => ErrorPayload {
                 kind: "login_failed",
-                message: api_err.to_string(),
+                message: format_api_error_message("login failed", *status, url),
                 status: Some(*status),
                 url: Some(url.as_str()),
-                body: Some(body.as_str()),
+                body: None,
             },
-            MobieApiError::RequestFailed { status, url, body } => ErrorPayload {
+            MobieApiError::RequestFailed { status, url, .. } => ErrorPayload {
                 kind: "request_failed",
-                message: api_err.to_string(),
+                message: format_api_error_message("request failed", *status, url),
                 status: Some(*status),
                 url: Some(url.as_str()),
-                body: Some(body.as_str()),
+                body: None,
             },
-            MobieApiError::Unauthorized { status, url, body } => ErrorPayload {
+            MobieApiError::Unauthorized { status, url, .. } => ErrorPayload {
                 kind: "unauthorized",
-                message: api_err.to_string(),
+                message: format_api_error_message("unauthorized", *status, url),
                 status: Some(*status),
                 url: Some(url.as_str()),
-                body: Some(body.as_str()),
+                body: None,
             },
-            MobieApiError::RateLimited {
-                status, url, body, ..
-            } => ErrorPayload {
+            MobieApiError::RateLimited { status, url, .. } => ErrorPayload {
                 kind: "rate_limited",
-                message: api_err.to_string(),
+                message: format_api_error_message("rate limited", *status, url),
                 status: Some(*status),
                 url: Some(url.as_str()),
-                body: Some(body.as_str()),
+                body: None,
             },
-            MobieApiError::ServerError { status, url, body } => ErrorPayload {
+            MobieApiError::ServerError { status, url, .. } => ErrorPayload {
                 kind: "server_error",
-                message: api_err.to_string(),
+                message: format_api_error_message("server error", *status, url),
                 status: Some(*status),
                 url: Some(url.as_str()),
-                body: Some(body.as_str()),
+                body: None,
             },
         },
         AppError::MissingCredential(_, _) => ErrorPayload {
@@ -1997,6 +2016,10 @@ fn error_payload(err: &AppError) -> ErrorPayload<'_> {
             body: None,
         },
     }
+}
+
+fn format_api_error_message(kind: &str, status: u16, url: &str) -> String {
+    format!("{kind}: {status} {url}")
 }
 
 #[cfg(test)]

@@ -10,10 +10,13 @@ fn sanitize_error_body_redacts_and_truncates() {
     assert!(!out.contains("secret"));
     assert!(out.contains("[REDACTED]"));
 
-    let long_body = "a".repeat(800);
+    let long_body = format!("error: {}", "a ".repeat(400));
     let truncated = sanitize_error_body(&long_body);
     assert!(truncated.len() <= 503);
     assert!(truncated.ends_with("..."));
+
+    let plain_text = "Bearer super-secret-access-token";
+    assert_eq!(sanitize_error_body(plain_text), "[REDACTED]");
 }
 
 #[test]

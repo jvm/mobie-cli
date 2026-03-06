@@ -72,9 +72,13 @@ pub fn sanitize_error_body(body: &str) -> String {
         if let Ok(mut value) = serde_json::from_str::<Value>(&unescaped) {
             redact_sensitive(&mut value);
             serde_json::to_string(&value).unwrap_or(unescaped)
+        } else if looks_sensitive_text(trimmed) {
+            "[REDACTED]".into()
         } else {
             trimmed.to_string()
         }
+    } else if looks_sensitive_text(trimmed) {
+        "[REDACTED]".into()
     } else {
         trimmed.to_string()
     };
@@ -83,6 +87,19 @@ pub fn sanitize_error_body(body: &str) -> String {
         out.push_str("...");
     }
     out
+}
+
+fn looks_sensitive_text(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("password")
+        || lower.contains("authorization")
+        || lower.contains("bearer ")
+        || lower.contains("api_key")
+        || lower.contains("secret")
+        || looks_like_jwt(body)
+        || looks_like_opaque_secret(body)
 }
 
 fn redact_sensitive(value: &mut Value) {
@@ -130,4 +147,13 @@ fn is_base64ish(s: &str) -> bool {
         && s.len() >= 8
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+')
+}
+
+fn looks_like_opaque_secret(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.len() >= 24
+        && !trimmed.contains(char::is_whitespace)
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='))
 }

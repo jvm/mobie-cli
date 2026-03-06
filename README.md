@@ -41,14 +41,14 @@ Optional:
 
 You can provide credentials in any of these ways:
 
-- CLI flags like `--email` and `--password`
+- `--email` plus `MOBIE_PASSWORD`
 - Exported environment variables
 - `dotenvx run -- ...`
 - A stored OS keychain session created with `mobie auth login`
 
 Precedence for authenticated commands:
 
-1. `--email` / `--password`
+1. explicit `--email` and/or environment-provided credentials
 2. exported env vars or `dotenvx`
 3. stored keychain session
 
@@ -58,7 +58,7 @@ Precedence for authenticated commands:
 - Linux Secret Service
 - Windows Credential Manager
 
-The password is used only for the login request and is not persisted by the CLI.
+The password is used only for the login request and is not persisted by the CLI. For local safety, `mobie` rejects `--password` on argv; use `MOBIE_PASSWORD`, `dotenvx`, or the interactive prompt instead.
 
 ### dotenvx
 
