@@ -866,6 +866,61 @@ fn logs_ttl() -> StdDuration {
     StdDuration::from_secs(60 * 15)
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OcppLogSyncWindow {
+    scope: String,
+    day_start: DateTime<Utc>,
+    day_end: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogOrder {
+    OldestFirst,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OcppLogLocalQuery {
+    limit: i64,
+    error_only: bool,
+    order: LogOrder,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OcppLogQueryPlan {
+    windows: Vec<OcppLogSyncWindow>,
+    query: OcppLogLocalQuery,
+}
+
+#[allow(dead_code)]
+fn ocpp_log_query_plan(limit: i64, error_only: bool, now: DateTime<Utc>) -> OcppLogQueryPlan {
+    OcppLogQueryPlan {
+        windows: ocpp_log_sync_windows(now),
+        query: OcppLogLocalQuery {
+            limit,
+            error_only,
+            order: LogOrder::OldestFirst,
+        },
+    }
+}
+
+#[allow(dead_code)]
+fn ocpp_log_sync_windows(now: DateTime<Utc>) -> Vec<OcppLogSyncWindow> {
+    let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let day_end = day_start
+        .checked_add_days(Days::new(1))
+        .expect("valid next-day boundary");
+
+    vec![OcppLogSyncWindow {
+        scope: "all-chargers".to_string(),
+        day_start,
+        day_end,
+    }]
+}
+
 fn session_cache_params(
     location: &str,
     limit: i64,
@@ -2639,5 +2694,39 @@ mod tests {
         assert!(ocpi_params.iter().any(|(key, value)| {
             *key == "order" && value == ORDERING_CACHE_VERSION
         }));
+    }
+
+    #[test]
+    fn ocpp_log_sync_windows_use_day_bucket_for_current_utc_day() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let windows = ocpp_log_sync_windows(anchor);
+
+        assert_eq!(
+            windows,
+            vec![OcppLogSyncWindow {
+                scope: "all-chargers".to_string(),
+                day_start: Utc.with_ymd_and_hms(2026, 3, 6, 0, 0, 0).unwrap(),
+                day_end: Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ocpp_log_query_plan_preserves_error_filter_and_ordering() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let plan = ocpp_log_query_plan(25, true, anchor);
+
+        assert_eq!(
+            plan.query,
+            OcppLogLocalQuery {
+                limit: 25,
+                error_only: true,
+                order: LogOrder::OldestFirst,
+            }
+        );
+        assert_eq!(plan.windows.len(), 1);
+        assert_eq!(plan.windows[0].scope, "all-chargers");
     }
 }
