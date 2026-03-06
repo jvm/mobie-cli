@@ -368,6 +368,41 @@ impl MobieClient {
         Ok(out)
     }
 
+    pub async fn sync_sessions_window(
+        &mut self,
+        location_id: &str,
+        page_limit: i64,
+        filters: &SessionFilters,
+    ) -> Result<Vec<Session>, MobieApiError> {
+        let mut effective_page_limit = clamp_limit(page_limit);
+        let mut offset = 0_i64;
+        let mut sessions = Vec::new();
+
+        loop {
+            let page = match self
+                .list_sessions_page_filtered(location_id, effective_page_limit, offset, filters)
+                .await
+            {
+                Ok(page) => page,
+                Err(err) if effective_page_limit > 50 => {
+                    effective_page_limit = 50;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if page.is_empty() {
+                break;
+            }
+
+            offset += page.len() as i64;
+            sessions.extend(page);
+        }
+
+        sessions.reverse();
+        Ok(sessions)
+    }
+
     pub async fn list_ocpp_logs_page(
         &mut self,
         limit: i64,
@@ -441,6 +476,24 @@ impl MobieClient {
             })
             .await?;
         // Reverse to show oldest first (top) and newest last (bottom)
+        logs.reverse();
+        Ok(logs)
+    }
+
+    pub async fn sync_ocpp_logs_window(
+        &mut self,
+        page_limit: i64,
+        error_only: bool,
+    ) -> Result<Vec<OcppLogEntry>, MobieApiError> {
+        let mut logs = self
+            .collect_paginated_until_empty(page_limit, |client, effective_page_limit, offset| {
+                Box::pin(client.list_ocpp_logs_page(
+                    effective_page_limit,
+                    offset,
+                    error_only,
+                ))
+            })
+            .await?;
         logs.reverse();
         Ok(logs)
     }
@@ -573,6 +626,45 @@ impl MobieClient {
                 all_items.truncate(target_count);
                 break;
             }
+        }
+
+        Ok(all_items)
+    }
+
+    async fn collect_paginated_until_empty<T, F>(
+        &mut self,
+        page_limit: i64,
+        mut fetch_page: F,
+    ) -> Result<Vec<T>, MobieApiError>
+    where
+        F: for<'a> FnMut(
+            &'a mut MobieClient,
+            i64,
+            i64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<T>, MobieApiError>> + 'a>,
+        >,
+    {
+        let mut effective_page_limit = clamp_limit(page_limit);
+        let mut offset = 0_i64;
+        let mut all_items = Vec::new();
+
+        loop {
+            let page = match fetch_page(self, effective_page_limit, offset).await {
+                Ok(page) => page,
+                Err(err) if effective_page_limit > 50 => {
+                    effective_page_limit = 50;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if page.is_empty() {
+                break;
+            }
+
+            offset += page.len() as i64;
+            all_items.extend(page);
         }
 
         Ok(all_items)
