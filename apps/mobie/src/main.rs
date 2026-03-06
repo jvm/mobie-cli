@@ -2263,12 +2263,7 @@ fn write_json<T: Serialize>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    let envelope = SuccessEnvelope {
-        ok: true,
-        resource,
-        data,
-        meta: Some(Meta { count }),
-    };
+    let envelope = success_envelope(resource, data, count, None);
     if pretty {
         serde_json::to_writer_pretty(&mut handle, &envelope)?;
     } else {
@@ -2299,12 +2294,7 @@ fn write_toon<T: Serialize>(
     data: &T,
     count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let envelope = SuccessEnvelope {
-        ok: true,
-        resource,
-        data,
-        meta: Some(Meta { count }),
-    };
+    let envelope = success_envelope(resource, data, count, None);
     let value = serde_json::to_value(&envelope)?;
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -3061,5 +3051,75 @@ mod tests {
         );
         assert_eq!(plan.windows.len(), 1);
         assert_eq!(plan.windows[0].scope, "all-chargers");
+    }
+
+    #[test]
+    fn success_envelope_json_omits_freshness_when_absent() {
+        let data = vec![serde_json::json!({"id": "S-1"})];
+        let envelope = success_envelope("sessions", &data, data.len(), None);
+
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["resource"], "sessions");
+        assert_eq!(value["meta"]["count"], 1);
+        assert!(value["meta"].get("freshness").is_none());
+    }
+
+    #[test]
+    fn success_envelope_json_serializes_freshness_metadata() {
+        let data = vec![serde_json::json!({"id": "S-1"})];
+        let envelope = success_envelope(
+            "sessions",
+            &data,
+            data.len(),
+            Some(FreshnessMeta {
+                state: "fresh",
+                source: Some("cache"),
+                as_of_epoch_ms: Some(1_741_254_400_000),
+                refreshed_at_epoch_ms: Some(1_741_254_401_000),
+                stale_after_epoch_ms: Some(1_741_257_999_000),
+                scope: Some("location:EVSE-1".into()),
+                detail: Some("covered by canonical session sync window".into()),
+            }),
+        );
+
+        let value = serde_json::to_value(&envelope).unwrap();
+
+        assert_eq!(value["meta"]["freshness"]["state"], "fresh");
+        assert_eq!(value["meta"]["freshness"]["source"], "cache");
+        assert_eq!(value["meta"]["freshness"]["scope"], "location:EVSE-1");
+        assert_eq!(
+            value["meta"]["freshness"]["detail"],
+            "covered by canonical session sync window"
+        );
+    }
+
+    #[test]
+    fn success_envelope_toon_serializes_freshness_metadata() {
+        let data = vec![serde_json::json!({"messageType": "BootNotification"})];
+        let envelope = success_envelope(
+            "logs",
+            &data,
+            data.len(),
+            Some(FreshnessMeta {
+                state: "stale",
+                source: Some("cache"),
+                as_of_epoch_ms: Some(1_741_254_400_000),
+                refreshed_at_epoch_ms: None,
+                stale_after_epoch_ms: Some(1_741_257_999_000),
+                scope: Some("charger:ABC/2026-03-06".into()),
+                detail: Some("refresh required before reuse".into()),
+            }),
+        );
+
+        let value = serde_json::to_value(&envelope).unwrap();
+        let toon = encode_toon_document(&value);
+
+        assert!(toon.contains("freshness:"));
+        assert!(toon.contains("state: stale"));
+        assert!(toon.contains("source: cache"));
+        assert!(toon.contains("scope: charger:ABC/2026-03-06"));
+        assert!(toon.contains("detail: refresh required before reuse"));
     }
 }
