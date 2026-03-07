@@ -62,6 +62,10 @@ pub struct SessionQuery {
 pub struct OcppLogQuery {
     pub limit: usize,
     pub error_only: bool,
+    pub location_id: Option<String>,
+    pub message_type: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub oldest_first: bool,
 }
 
@@ -77,6 +81,15 @@ pub struct CacheHandle {
     store: Option<CacheStore>,
     unavailable_reason: Option<String>,
     warned_unavailable: bool,
+}
+
+struct SyncContext<'a> {
+    base_url: &'a str,
+    user_email: &'a str,
+    profile: &'a str,
+    scope: &'a str,
+    fetched_at_epoch_ms: i64,
+    expires_at_epoch_ms: i64,
 }
 
 impl CacheHandle {
@@ -123,11 +136,12 @@ impl CacheHandle {
     }
 
     pub fn warn_if_unavailable(&mut self, emit_warning: bool) {
-        if emit_warning && !self.warned_unavailable {
-            if let Some(reason) = self.unavailable_reason.as_deref() {
-                eprintln!("warning: cache disabled: {reason}");
-                self.warned_unavailable = true;
-            }
+        if emit_warning
+            && !self.warned_unavailable
+            && let Some(reason) = self.unavailable_reason.as_deref()
+        {
+            eprintln!("warning: cache disabled: {reason}");
+            self.warned_unavailable = true;
         }
     }
 
@@ -555,8 +569,12 @@ impl CacheStore {
                AND user_email = ?2
                AND profile = ?3
                AND (?4 = 0 OR is_error = 1)
+               AND (?5 IS NULL OR log_id = ?5)
+               AND (?6 IS NULL OR message_type = ?6)
+               AND (?7 IS NULL OR timestamp >= ?7)
+               AND (?8 IS NULL OR timestamp <= ?8)
              ORDER BY timestamp {order}, sort_key {order}, log_key {order}
-             LIMIT ?5"
+             LIMIT ?9"
         );
 
         let mut stmt = self
@@ -570,6 +588,10 @@ impl CacheStore {
                     user_email,
                     profile,
                     query.error_only,
+                    query.location_id,
+                    query.message_type,
+                    query.from,
+                    query.to,
                     i64::try_from(query.limit).unwrap_or(i64::MAX),
                 ],
                 |row| row.get::<_, String>(0),
@@ -765,136 +787,69 @@ fn sync_domain_tables(
     let Some(profile) = lookup.profile.as_deref() else {
         return Ok(());
     };
-    let base_url = lookup.base_url.as_str();
+    let context = SyncContext {
+        base_url: lookup.base_url.as_str(),
+        user_email,
+        profile,
+        scope,
+        fetched_at_epoch_ms,
+        expires_at_epoch_ms,
+    };
 
     match resource {
-        "locations" => sync_locations(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
-        "location" => sync_single_location(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
-        "sessions" => sync_sessions(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
-        "tokens" => sync_tokens(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
-        "logs" => sync_ocpp_logs(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
-        "location_analytics" | "location_geojson" | "ocpi_logs" => sync_json_resource(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            resource,
-            scope,
-            payload,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        ),
+        "locations" => sync_locations(tx, &context, payload),
+        "location" => sync_single_location(tx, &context, payload),
+        "sessions" => sync_sessions(tx, &context, payload),
+        "tokens" => sync_tokens(tx, &context, payload),
+        "logs" => sync_ocpp_logs(tx, &context, payload),
+        "location_analytics" | "location_geojson" | "ocpi_logs" => {
+            sync_json_resource(tx, &context, resource, payload)
+        }
         _ => Ok(()),
     }
 }
 
 fn sync_locations(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let items = payload
         .as_array()
         .ok_or_else(|| "locations payload was not an array".to_string())?;
-    tx.execute("DELETE FROM locations WHERE scope = ?1", params![scope])
-        .map_err(|err| format!("failed to clear locations scope: {err}"))?;
+    tx.execute(
+        "DELETE FROM locations
+         WHERE base_url = ?1
+           AND user_email = ?2
+           AND profile = ?3
+           AND scope = ?4",
+        params![
+            context.base_url,
+            context.user_email,
+            context.profile,
+            context.scope
+        ],
+    )
+    .map_err(|err| format!("failed to clear locations scope: {err}"))?;
 
     for item in items {
-        upsert_location(
-            tx,
-            base_url,
-            user_email,
-            profile,
-            scope,
-            item,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
-        )?;
+        upsert_location(tx, context, item)?;
     }
     Ok(())
 }
 
 fn sync_single_location(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
-    upsert_location(
-        tx,
-        base_url,
-        user_email,
-        profile,
-        scope,
-        payload,
-        fetched_at_epoch_ms,
-        expires_at_epoch_ms,
-    )
+    upsert_location(tx, context, payload)
 }
 
 fn upsert_location(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     item: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let location_id = item
         .get("location_id")
@@ -930,14 +885,14 @@ fn upsert_location(
             speed = excluded.speed,
             state = excluded.state",
         params![
-            base_url,
-            user_email,
-            profile,
+            context.base_url,
+            context.user_email,
+            context.profile,
             location_id,
-            scope,
+            context.scope,
             payload_json,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms,
+            context.fetched_at_epoch_ms,
+            context.expires_at_epoch_ms,
             latitude,
             longitude,
             status,
@@ -951,20 +906,27 @@ fn upsert_location(
 
 fn sync_sessions(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let items = payload
         .as_array()
         .ok_or_else(|| "sessions payload was not an array".to_string())?;
-    let scoped_location_id = scope_param_string(scope, "location");
-    tx.execute("DELETE FROM sessions WHERE scope = ?1", params![scope])
-        .map_err(|err| format!("failed to clear sessions scope: {err}"))?;
+    let scoped_location_id = scope_param_string(context.scope, "location");
+    tx.execute(
+        "DELETE FROM sessions
+         WHERE base_url = ?1
+           AND user_email = ?2
+           AND profile = ?3
+           AND scope = ?4",
+        params![
+            context.base_url,
+            context.user_email,
+            context.profile,
+            context.scope
+        ],
+    )
+    .map_err(|err| format!("failed to clear sessions scope: {err}"))?;
 
     for item in items {
         let session_id = item
@@ -998,14 +960,14 @@ fn sync_sessions(
                 token_uid = excluded.token_uid,
                 kwh = excluded.kwh",
             params![
-                base_url,
-                user_email,
-                profile,
+                context.base_url,
+                context.user_email,
+                context.profile,
                 session_id,
-                scope,
+                context.scope,
                 payload_json,
-                fetched_at_epoch_ms,
-                expires_at_epoch_ms,
+                context.fetched_at_epoch_ms,
+                context.expires_at_epoch_ms,
                 item.get("start_date_time").and_then(json_scalar_to_string),
                 item.get("end_date_time").and_then(json_scalar_to_string),
                 item.get("status").and_then(json_scalar_to_string),
@@ -1025,25 +987,32 @@ fn sync_sessions(
 
 fn sync_tokens(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let items = payload
         .as_array()
         .ok_or_else(|| "tokens payload was not an array".to_string())?;
-    tx.execute("DELETE FROM tokens WHERE scope = ?1", params![scope])
-        .map_err(|err| format!("failed to clear tokens scope: {err}"))?;
+    tx.execute(
+        "DELETE FROM tokens
+         WHERE base_url = ?1
+           AND user_email = ?2
+           AND profile = ?3
+           AND scope = ?4",
+        params![
+            context.base_url,
+            context.user_email,
+            context.profile,
+            context.scope
+        ],
+    )
+    .map_err(|err| format!("failed to clear tokens scope: {err}"))?;
 
     for (index, item) in items.iter().enumerate() {
         let token_uid = item.get("token_uid").and_then(json_scalar_to_string);
         let token_key = token_uid
             .clone()
-            .unwrap_or_else(|| format!("scope:{scope}:index:{index}"));
+            .unwrap_or_else(|| format!("scope:{}:index:{index}", context.scope));
         let payload_json = serde_json::to_string(item)
             .map_err(|err| format!("failed to serialize token row: {err}"))?;
 
@@ -1058,14 +1027,14 @@ fn sync_tokens(
                 expires_at = excluded.expires_at,
                 token_uid = excluded.token_uid",
             params![
-                base_url,
-                user_email,
-                profile,
+                context.base_url,
+                context.user_email,
+                context.profile,
                 token_key,
-                scope,
+                context.scope,
                 payload_json,
-                fetched_at_epoch_ms,
-                expires_at_epoch_ms,
+                context.fetched_at_epoch_ms,
+                context.expires_at_epoch_ms,
                 token_uid
             ],
         )
@@ -1076,20 +1045,27 @@ fn sync_tokens(
 
 fn sync_ocpp_logs(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
-    scope: &str,
+    context: &SyncContext<'_>,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let items = payload
         .as_array()
         .ok_or_else(|| "logs payload was not an array".to_string())?;
-    let is_error_scope = scope_param_bool(scope, "error_only");
-    tx.execute("DELETE FROM ocpp_logs WHERE scope = ?1", params![scope])
-        .map_err(|err| format!("failed to clear logs scope: {err}"))?;
+    let is_error_scope = scope_param_bool(context.scope, "error_only");
+    tx.execute(
+        "DELETE FROM ocpp_logs
+         WHERE base_url = ?1
+           AND user_email = ?2
+           AND profile = ?3
+           AND scope = ?4",
+        params![
+            context.base_url,
+            context.user_email,
+            context.profile,
+            context.scope
+        ],
+    )
+    .map_err(|err| format!("failed to clear logs scope: {err}"))?;
 
     for (index, item) in items.iter().enumerate() {
         let log_id = item.get("id").and_then(json_scalar_to_string);
@@ -1117,14 +1093,14 @@ fn sync_ocpp_logs(
                 sort_key = min(ocpp_logs.sort_key, excluded.sort_key),
                 is_error = max(ocpp_logs.is_error, excluded.is_error)",
             params![
-                base_url,
-                user_email,
-                profile,
+                context.base_url,
+                context.user_email,
+                context.profile,
                 fingerprint,
-                scope,
+                context.scope,
                 payload_json,
-                fetched_at_epoch_ms,
-                expires_at_epoch_ms,
+                context.fetched_at_epoch_ms,
+                context.expires_at_epoch_ms,
                 log_id,
                 timestamp,
                 ocpp_log_field(item, &["message_type", "messageType"]),
@@ -1141,14 +1117,9 @@ fn sync_ocpp_logs(
 
 fn sync_json_resource(
     tx: &rusqlite::Transaction<'_>,
-    base_url: &str,
-    user_email: &str,
-    profile: &str,
+    context: &SyncContext<'_>,
     resource: &str,
-    scope: &str,
     payload: &Value,
-    fetched_at_epoch_ms: i64,
-    expires_at_epoch_ms: i64,
 ) -> Result<(), String> {
     let payload_json = serde_json::to_string(payload)
         .map_err(|err| format!("failed to serialize json resource row: {err}"))?;
@@ -1156,19 +1127,19 @@ fn sync_json_resource(
         "INSERT INTO json_resources (
             base_url, user_email, profile, resource, scope, payload_json, fetched_at, expires_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(base_url, user_email, profile, resource, scope) DO UPDATE SET
+        ON CONFLICT(base_url, user_email, profile, resource, scope) DO UPDATE SET
             payload_json = excluded.payload_json,
             fetched_at = excluded.fetched_at,
             expires_at = excluded.expires_at",
         params![
-            base_url,
-            user_email,
-            profile,
+            context.base_url,
+            context.user_email,
+            context.profile,
             resource,
-            scope,
+            context.scope,
             payload_json,
-            fetched_at_epoch_ms,
-            expires_at_epoch_ms
+            context.fetched_at_epoch_ms,
+            context.expires_at_epoch_ms
         ],
     )
     .map_err(|err| format!("failed to upsert json resource row: {err}"))?;
@@ -1190,17 +1161,20 @@ fn ocpp_log_field(item: &Value, keys: &[&str]) -> Option<String> {
         .find_map(|key| item.get(*key).and_then(json_scalar_to_string))
 }
 
+fn canonicalize_ocpp_payload(value: Option<&Value>) -> Value {
+    match value.cloned().unwrap_or(Value::Null) {
+        Value::String(raw) => serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw)),
+        other => other,
+    }
+}
+
 fn ocpp_log_fingerprint(item: &Value) -> Result<String, String> {
     serde_json::to_string(&serde_json::json!({
         "id": item.get("id").and_then(json_scalar_to_string),
         "timestamp": item.get("timestamp").and_then(json_scalar_to_string),
         "direction": item.get("direction").and_then(json_scalar_to_string),
         "message_type": ocpp_log_field(item, &["message_type", "messageType"]),
-        "payload": item
-            .get("logs")
-            .cloned()
-            .or_else(|| item.get("payload").cloned())
-            .unwrap_or(Value::Null),
+        "payload": canonicalize_ocpp_payload(item.get("logs").or_else(|| item.get("payload"))),
     }))
     .map_err(|err| format!("failed to encode ocpp log fingerprint: {err}"))
 }
@@ -1633,6 +1607,29 @@ mod tests {
     }
 
     #[test]
+    fn ocpp_log_fingerprint_normalizes_equivalent_json_payloads() {
+        let string_payload = serde_json::json!({
+            "id": "MOBI-LSB-00693",
+            "messageType": "Heartbeat",
+            "direction": "Response",
+            "timestamp": "2026-03-06T19:45:53.176Z",
+            "logs": "{\"currentTime\":\"2026-03-06T19:45:53.176Z\"}"
+        });
+        let object_payload = serde_json::json!({
+            "id": "MOBI-LSB-00693",
+            "messageType": "Heartbeat",
+            "direction": "Response",
+            "timestamp": "2026-03-06T19:45:53.176Z",
+            "logs": {"currentTime": "2026-03-06T19:45:53.176Z"}
+        });
+
+        assert_eq!(
+            ocpp_log_fingerprint(&string_payload).unwrap(),
+            ocpp_log_fingerprint(&object_payload).unwrap()
+        );
+    }
+
+    #[test]
     fn ocpp_log_sort_key_is_deterministic() {
         let first = ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 0);
         let second = ocpp_log_sort_key(Some("2026-03-06T19:45:53.176Z"), 1);
@@ -1889,6 +1886,10 @@ mod tests {
                     params: vec![
                         ("limit", "10".to_string()),
                         ("error_only", "true".to_string()),
+                        ("location", "LOC-1".to_string()),
+                        ("message_type", "Heartbeat".to_string()),
+                        ("from", "2026-03-06T00:00:00Z".to_string()),
+                        ("to", "2026-03-06T23:59:59Z".to_string()),
                     ],
                 },
                 &vec![
@@ -1897,7 +1898,7 @@ mod tests {
                         "messageType": "Heartbeat",
                         "direction": "Response",
                         "timestamp": "2026-03-06T10:00:00Z",
-                        "logs": "{\"status\":\"ok\"}"
+                        "logs": "{\"currentTime\":\"2026-03-06T10:00:00Z\"}"
                     }),
                     serde_json::json!({
                         "id": "LOC-1",
@@ -1918,14 +1919,18 @@ mod tests {
                     params: vec![
                         ("limit", "10".to_string()),
                         ("error_only", "false".to_string()),
+                        ("location", "-".to_string()),
+                        ("message_type", "-".to_string()),
+                        ("from", "2026-03-06T00:00:00Z".to_string()),
+                        ("to", "2026-03-06T23:59:59Z".to_string()),
                     ],
                 },
                 &vec![serde_json::json!({
-                    "id": "LOC-1",
+                    "id": "LOC-2",
                     "messageType": "MeterValues",
                     "direction": "Request",
                     "timestamp": "2026-03-06T08:00:00Z",
-                    "logs": "{\"transactionId\":123}"
+                    "logs": "{\"connectorId\":1,\"transactionId\":123,\"meterValue\":[]}"
                 })],
             )
             .unwrap();
@@ -1936,6 +1941,10 @@ mod tests {
                 &OcppLogQuery {
                     limit: 10,
                     error_only: true,
+                    location_id: Some("LOC-1".to_string()),
+                    message_type: Some("Heartbeat".to_string()),
+                    from: Some("2026-03-06T00:00:00Z".to_string()),
+                    to: Some("2026-03-06T23:59:59Z".to_string()),
                     oldest_first: true,
                 },
             )
@@ -1944,10 +1953,7 @@ mod tests {
             .into_iter()
             .map(|log| log.timestamp.unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            error_timestamps,
-            vec!["2026-03-06T09:00:00Z", "2026-03-06T10:00:00Z"]
-        );
+        assert_eq!(error_timestamps, vec!["2026-03-06T10:00:00Z"]);
 
         let all_logs = store
             .read_ocpp_logs(
@@ -1955,6 +1961,10 @@ mod tests {
                 &OcppLogQuery {
                     limit: 2,
                     error_only: false,
+                    location_id: None,
+                    message_type: None,
+                    from: Some("2026-03-06T08:00:00Z".to_string()),
+                    to: Some("2026-03-06T09:00:00Z".to_string()),
                     oldest_first: true,
                 },
             )

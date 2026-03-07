@@ -1,4 +1,7 @@
 /target
+.DS_Store
+.DS_Store?
+.env
 .env.keys
 .env.local
 .env.*.local

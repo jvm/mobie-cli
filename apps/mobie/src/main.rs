@@ -12,7 +12,7 @@ use cache::{
 };
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use mobie_api::{AccessContext, MobieApiError, MobieClient, SessionFilters};
+use mobie_api::{AccessContext, MobieApiError, MobieClient, OcppLogFilters, SessionFilters};
 use mobie_models::{LocationDetail, LocationSummary, OcppLogEntry, Session, TokenInfo};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -224,6 +224,20 @@ enum LogCommand {
     List {
         #[arg(long, default_value_t = 200)]
         limit: i64,
+
+        #[arg(long)]
+        location: Option<String>,
+
+        #[arg(long)]
+        message_type: Option<String>,
+
+        /// Inclusive range start: year (2026), date (2026-03-02 or 02-03-2026), or RFC3339 timestamp.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Inclusive range end for dates; RFC3339 timestamps are used as-is.
+        #[arg(long)]
+        to: Option<String>,
 
         #[arg(long, default_value_t = false)]
         error_only: bool,
@@ -732,6 +746,18 @@ async fn execute_cached_session_command<S: SessionStore>(
             let limit = *limit;
             let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
             let plan = session_query_plan(&location, limit, &filters, Utc::now());
+            let session_query = CacheSessionQuery {
+                location_id: plan.query.location_id.clone(),
+                from: plan.query.date_from.clone(),
+                to: plan.query.date_to.clone(),
+                limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
+                oldest_first: matches!(plan.query.order, SessionQueryOrder::OldestFirst),
+            };
+            let spec = CacheSpec {
+                resource: "sessions",
+                ttl: sessions_ttl(),
+                params: session_cache_params(&location, limit, &filters),
+            };
             let mut lookup = cache_lookup(cli, store)?;
             if lookup.profile.is_none() {
                 match cache.infer_profile(&lookup) {
@@ -760,34 +786,72 @@ async fn execute_cached_session_command<S: SessionStore>(
 
             if needs_refresh {
                 let mut authed = resolve_authenticated_client(cli, store).await?;
-                let data = authed
+                match authed
                     .client
                     .sync_sessions_window(&location, limit, &filters)
-                    .await?;
-                persist_session_if_needed(store, cli, &authed)?;
+                    .await
+                {
+                    Ok(data) => {
+                        persist_session_if_needed(store, cli, &authed)?;
 
-                if let Some(access) = authed.client.access_context() {
-                    lookup = CacheLookup {
-                        base_url: canonical_base_url(&cli.base_url),
-                        user_email: Some(access.user_email.clone()),
-                        profile: Some(access.profile.clone()),
-                    };
-                    let spec = CacheSpec {
-                        resource: "sessions",
-                        ttl: sessions_ttl(),
-                        params: session_cache_params(&location, limit, &filters),
-                    };
-                    if let Err(err) = cache.put(&lookup, &spec, &data) {
-                        cache_warn(cli, cache, &err);
+                        if let Some(access) = authed.client.access_context() {
+                            lookup = CacheLookup {
+                                base_url: canonical_base_url(&cli.base_url),
+                                user_email: Some(access.user_email.clone()),
+                                profile: Some(access.profile.clone()),
+                            };
+                            if let Err(err) = cache.put(&lookup, &spec, &data) {
+                                cache_warn(cli, cache, &err);
+                            }
+                            if let Err(err) = cache.record_sync_success(
+                                "sessions",
+                                &plan.scope,
+                                Some(&plan.refresh.window_start),
+                                Some(&plan.refresh.window_end),
+                                current_epoch_ms(),
+                            ) {
+                                cache_warn(cli, cache, &err);
+                            }
+                        }
                     }
-                    if let Err(err) = cache.record_sync_success(
-                        "sessions",
-                        &plan.scope,
-                        Some(&plan.refresh.window_start),
-                        Some(&plan.refresh.window_end),
-                        current_epoch_ms(),
-                    ) {
-                        cache_warn(cli, cache, &err);
+                    Err(err) => {
+                        if authed.client.access_context().is_some() {
+                            let error_json =
+                                serde_json::json!({ "message": err.to_string() }).to_string();
+                            if let e @ Err(_) = cache.record_sync_failure(
+                                "sessions",
+                                &plan.scope,
+                                Some(&plan.refresh.window_start),
+                                Some(&plan.refresh.window_end),
+                                current_epoch_ms(),
+                                &error_json,
+                            ) {
+                                cache_warn(cli, cache, &e.unwrap_err());
+                            }
+                        }
+
+                        let sessions = cache
+                            .read_sessions(&lookup, &session_query)
+                            .map_err(AppError::InvalidInput)?;
+                        if !sessions.is_empty() {
+                            let freshness = freshness_from_window(
+                                cache
+                                    .get_sync_window(
+                                        "sessions",
+                                        &plan.scope,
+                                        Some(&plan.refresh.window_start),
+                                        Some(&plan.refresh.window_end),
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .as_ref(),
+                                sessions_ttl(),
+                                plan.scope.clone(),
+                                current_epoch_ms(),
+                            );
+                            return Ok(Output::Sessions(sessions, freshness));
+                        }
+                        return Err(AppError::from(err));
                     }
                 }
             }
@@ -810,19 +874,7 @@ async fn execute_cached_session_command<S: SessionStore>(
 
             Ok(Output::Sessions(
                 cache
-                    .read_sessions(
-                        &lookup,
-                        &CacheSessionQuery {
-                            location_id: plan.query.location_id,
-                            from: plan.query.date_from,
-                            to: plan.query.date_to,
-                            limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
-                            oldest_first: matches!(
-                                plan.query.order,
-                                SessionQueryOrder::OldestFirst
-                            ),
-                        },
-                    )
+                    .read_sessions(&lookup, &session_query)
                     .map_err(AppError::InvalidInput)?,
                 freshness,
             ))
@@ -871,18 +923,33 @@ async fn execute_cached_log_command<S: SessionStore>(
     command: &LogCommand,
 ) -> Result<Output, AppError> {
     match command {
-        LogCommand::List { limit, error_only } => {
+        LogCommand::List {
+            limit,
+            location,
+            message_type,
+            from,
+            to,
+            error_only,
+        } => {
             debug_assert!(matches!(
                 cache_resource_strategy("logs"),
                 CacheResourceStrategy::CanonicalRecords
             ));
             let limit = *limit;
             let error_only = *error_only;
-            let plan = ocpp_log_query_plan(limit, error_only, Utc::now());
+            let plan = ocpp_log_query_plan(
+                limit,
+                location.as_deref(),
+                message_type.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                error_only,
+                Utc::now(),
+            )?;
             let spec = CacheSpec {
                 resource: "logs",
                 ttl: logs_ttl(),
-                params: ocpp_log_cache_params(limit, error_only),
+                params: ocpp_log_cache_params(limit, &plan.api_filters),
             };
             let mut lookup = cache_lookup(cli, store)?;
             if lookup.profile.is_none() {
@@ -922,7 +989,11 @@ async fn execute_cached_log_command<S: SessionStore>(
 
             if needs_refresh {
                 let mut authed = resolve_authenticated_client(cli, store).await?;
-                match authed.client.sync_ocpp_logs_window(limit, error_only).await {
+                match authed
+                    .client
+                    .sync_ocpp_logs_window(limit, &plan.api_filters)
+                    .await
+                {
                     Ok(data) => {
                         persist_session_if_needed(store, cli, &authed)?;
 
@@ -984,6 +1055,10 @@ async fn execute_cached_log_command<S: SessionStore>(
                                         limit: usize::try_from(plan.query.limit)
                                             .unwrap_or(usize::MAX),
                                         error_only: plan.query.error_only,
+                                        location_id: plan.query.location_id.clone(),
+                                        message_type: plan.query.message_type.clone(),
+                                        from: plan.query.from.clone(),
+                                        to: plan.query.to.clone(),
                                         oldest_first: matches!(
                                             plan.query.order,
                                             LogOrder::OldestFirst
@@ -1034,6 +1109,10 @@ async fn execute_cached_log_command<S: SessionStore>(
                     &CacheOcppLogQuery {
                         limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
                         error_only: plan.query.error_only,
+                        location_id: plan.query.location_id.clone(),
+                        message_type: plan.query.message_type.clone(),
+                        from: plan.query.from.clone(),
+                        to: plan.query.to.clone(),
                         oldest_first: matches!(plan.query.order, LogOrder::OldestFirst),
                     },
                 )
@@ -1322,6 +1401,10 @@ enum LogOrder {
 struct OcppLogLocalQuery {
     limit: i64,
     error_only: bool,
+    location_id: Option<String>,
+    message_type: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
     order: LogOrder,
 }
 
@@ -1330,36 +1413,65 @@ struct OcppLogLocalQuery {
 struct OcppLogQueryPlan {
     windows: Vec<OcppLogSyncWindow>,
     query: OcppLogLocalQuery,
+    api_filters: OcppLogFilters,
 }
 
 #[allow(dead_code)]
-fn ocpp_log_query_plan(limit: i64, error_only: bool, now: DateTime<Utc>) -> OcppLogQueryPlan {
-    OcppLogQueryPlan {
-        windows: ocpp_log_sync_windows(now, error_only),
+fn ocpp_log_query_plan(
+    limit: i64,
+    location: Option<&str>,
+    message_type: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    error_only: bool,
+    now: DateTime<Utc>,
+) -> Result<OcppLogQueryPlan, AppError> {
+    let filters = parse_ocpp_log_filters(location, message_type, from, to, error_only, now)?;
+    Ok(OcppLogQueryPlan {
+        windows: ocpp_log_sync_windows(&filters),
         query: OcppLogLocalQuery {
             limit,
-            error_only,
+            error_only: filters.error_only,
+            location_id: filters.location_id.clone(),
+            message_type: filters.message_type.clone(),
+            from: filters.start_date.clone(),
+            to: filters.end_date.clone(),
             order: LogOrder::OldestFirst,
         },
-    }
+        api_filters: filters,
+    })
 }
 
 #[allow(dead_code)]
-fn ocpp_log_sync_windows(now: DateTime<Utc>, error_only: bool) -> Vec<OcppLogSyncWindow> {
-    let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let day_end = day_start
-        .checked_add_days(Days::new(1))
-        .expect("valid next-day boundary");
-
+fn ocpp_log_sync_windows(filters: &OcppLogFilters) -> Vec<OcppLogSyncWindow> {
+    let day_start = parse_rfc3339_utc(
+        filters
+            .start_date
+            .as_deref()
+            .expect("planned OCPP query start date"),
+    )
+    .expect("valid planned OCPP query start date");
+    let day_end = parse_rfc3339_utc(
+        filters
+            .end_date
+            .as_deref()
+            .expect("planned OCPP query end date"),
+    )
+    .expect("valid planned OCPP query end date");
     vec![OcppLogSyncWindow {
-        scope: if error_only {
-            "all-chargers:error-only".to_string()
-        } else {
-            "all-chargers:all".to_string()
-        },
+        scope: ocpp_log_sync_scope(filters),
         day_start,
         day_end,
     }]
+}
+
+fn ocpp_log_sync_scope(filters: &OcppLogFilters) -> String {
+    format!(
+        "location:{}:message_type:{}:error_only:{}",
+        filters.location_id.as_deref().unwrap_or("-"),
+        filters.message_type.as_deref().unwrap_or("-"),
+        filters.error_only
+    )
 }
 
 fn session_cache_params(
@@ -1423,11 +1535,36 @@ fn session_query_plan(
     }
 }
 
-fn ocpp_log_cache_params(limit: i64, error_only: bool) -> Vec<(&'static str, String)> {
+fn ocpp_log_cache_params(limit: i64, filters: &OcppLogFilters) -> Vec<(&'static str, String)> {
     vec![
         ("limit", limit.to_string()),
         ("order", ORDERING_CACHE_VERSION.to_string()),
-        ("error_only", error_only.to_string()),
+        ("error_only", filters.error_only.to_string()),
+        (
+            "location",
+            filters
+                .location_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "message_type",
+            filters
+                .message_type
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "from",
+            filters
+                .start_date
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "to",
+            filters.end_date.clone().unwrap_or_else(|| "-".to_string()),
+        ),
     ]
 }
 
@@ -1536,6 +1673,56 @@ fn parse_session_filters(from: Option<&str>, to: Option<&str>) -> Result<Session
     })
 }
 
+fn parse_ocpp_log_filters(
+    location: Option<&str>,
+    message_type: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    error_only: bool,
+    now: DateTime<Utc>,
+) -> Result<OcppLogFilters, AppError> {
+    let end = match to {
+        Some(input) => parse_date_end(input)?,
+        None => end_of_previous_millisecond(
+            now.date_naive()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .checked_add_days(Days::new(1))
+                .expect("valid next-day boundary"),
+            "today",
+        )?,
+    };
+
+    let start = match from {
+        Some(input) => parse_date_start(input)?,
+        None => end
+            .checked_sub_signed(Duration::days(7))
+            .ok_or_else(|| AppError::InvalidInput("invalid derived OCPP log start date".into()))?,
+    };
+
+    if start > end {
+        return Err(AppError::InvalidInput(format!(
+            "invalid range: --from {start} must be earlier than or equal to --to {end}"
+        )));
+    }
+
+    if end.signed_duration_since(start) > Duration::days(7) {
+        return Err(AppError::InvalidInput(
+            "invalid OCPP log range: the interval between --from and --to must be 7 days or less"
+                .to_string(),
+        ));
+    }
+
+    Ok(OcppLogFilters {
+        start_date: Some(format_api_timestamp(start)),
+        end_date: Some(format_api_timestamp(end)),
+        location_id: location.map(str::to_string),
+        message_type: message_type.map(str::to_string),
+        error_only,
+    })
+}
+
 fn parse_date_start(input: &str) -> Result<DateTime<Utc>, AppError> {
     let s = input.trim();
 
@@ -1627,6 +1814,12 @@ fn end_of_previous_millisecond(
 
 fn format_api_timestamp(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn parse_rfc3339_utc(input: &str) -> Result<DateTime<Utc>, AppError> {
+    DateTime::parse_from_rfc3339(input)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|err| AppError::InvalidInput(format!("invalid RFC3339 timestamp {input}: {err}")))
 }
 
 fn render_output(cli: &Cli, output: &Output) -> Result<(), Box<dyn std::error::Error>> {
@@ -2456,7 +2649,7 @@ fn render_terminal_generic_json_object(value: &Value) {
     }
 }
 
-fn collect_scalar_columns<'a>(items: &'a [Value], limit: usize) -> Vec<&'a str> {
+fn collect_scalar_columns(items: &[Value], limit: usize) -> Vec<&str> {
     items
         .first()
         .and_then(Value::as_object)
@@ -2537,8 +2730,8 @@ fn render_toon_output(output: &Output, _pretty: bool) -> Result<(), Box<dyn std:
         Output::Auth(data) => write_toon("auth", data, 1)?,
         Output::AuthStatus(data) => write_toon("auth_status", data, 1)?,
         Output::AuthLogout(data) => write_toon("auth_logout", data, 1)?,
-        Output::JsonObject(resource, data) => write_toon(*resource, data, 1)?,
-        Output::JsonArray(resource, data) => write_toon(*resource, data, data.len())?,
+        Output::JsonObject(resource, data) => write_toon(resource, data, 1)?,
+        Output::JsonArray(resource, data) => write_toon(resource, data, data.len())?,
         Output::Locations(data) => write_toon("locations", data, data.len())?,
         Output::Location(data) => write_toon("location", data, 1)?,
         Output::Sessions(data, _) => {
@@ -3283,7 +3476,14 @@ mod tests {
 
     #[test]
     fn log_cache_params_include_ordering_version() {
-        let ocpp_params = ocpp_log_cache_params(25, true);
+        let ocpp_filters = OcppLogFilters {
+            start_date: Some("2026-03-01T00:00:00.000Z".into()),
+            end_date: Some("2026-03-07T23:59:59.999Z".into()),
+            location_id: Some("EVSE-1".into()),
+            message_type: Some("Heartbeat".into()),
+            error_only: true,
+        };
+        let ocpp_params = ocpp_log_cache_params(25, &ocpp_filters);
         let ocpi_params = ocpi_log_cache_params(25);
 
         assert!(
@@ -3299,37 +3499,149 @@ mod tests {
     }
 
     #[test]
-    fn ocpp_log_sync_windows_use_day_bucket_for_current_utc_day() {
+    fn ocpp_log_sync_windows_use_query_range_and_scope() {
         let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
-
-        let windows = ocpp_log_sync_windows(anchor, false);
+        let filters =
+            parse_ocpp_log_filters(Some("EVSE-1"), Some("Heartbeat"), None, None, false, anchor)
+                .unwrap();
+        let windows = ocpp_log_sync_windows(&filters);
 
         assert_eq!(
             windows,
             vec![OcppLogSyncWindow {
-                scope: "all-chargers:all".to_string(),
-                day_start: Utc.with_ymd_and_hms(2026, 3, 6, 0, 0, 0).unwrap(),
-                day_end: Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap(),
+                scope: "location:EVSE-1:message_type:Heartbeat:error_only:false".to_string(),
+                day_start: parse_rfc3339_utc("2026-02-27T23:59:59.999Z").unwrap(),
+                day_end: parse_rfc3339_utc("2026-03-06T23:59:59.999Z").unwrap(),
             }]
         );
     }
 
     #[test]
-    fn ocpp_log_query_plan_preserves_error_filter_and_ordering() {
+    fn ocpp_log_query_plan_preserves_filters_and_ordering() {
         let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
 
-        let plan = ocpp_log_query_plan(25, true, anchor);
+        let plan = ocpp_log_query_plan(
+            25,
+            Some("EVSE-1"),
+            Some("Heartbeat"),
+            Some("2026-03-01"),
+            Some("2026-03-03"),
+            true,
+            anchor,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.query,
             OcppLogLocalQuery {
                 limit: 25,
                 error_only: true,
+                location_id: Some("EVSE-1".into()),
+                message_type: Some("Heartbeat".into()),
+                from: Some("2026-03-01T00:00:00.000Z".into()),
+                to: Some("2026-03-03T23:59:59.999Z".into()),
                 order: LogOrder::OldestFirst,
             }
         );
         assert_eq!(plan.windows.len(), 1);
-        assert_eq!(plan.windows[0].scope, "all-chargers:error-only");
+        assert_eq!(
+            plan.windows[0].scope,
+            "location:EVSE-1:message_type:Heartbeat:error_only:true"
+        );
+    }
+
+    #[test]
+    fn parse_ocpp_log_filters_defaults_to_last_seven_days_ending_today() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let filters = parse_ocpp_log_filters(None, None, None, None, false, anchor).unwrap();
+
+        assert_eq!(
+            filters.start_date.as_deref(),
+            Some("2026-02-27T23:59:59.999Z")
+        );
+        assert_eq!(
+            filters.end_date.as_deref(),
+            Some("2026-03-06T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn parse_ocpp_log_filters_with_from_only_uses_end_of_today() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let filters =
+            parse_ocpp_log_filters(None, None, Some("2026-03-01"), None, false, anchor).unwrap();
+
+        assert_eq!(
+            filters.start_date.as_deref(),
+            Some("2026-03-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            filters.end_date.as_deref(),
+            Some("2026-03-06T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn parse_ocpp_log_filters_with_date_only_to_uses_inclusive_end_of_day() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let filters = parse_ocpp_log_filters(
+            None,
+            None,
+            Some("2026-03-01"),
+            Some("2026-03-03"),
+            false,
+            anchor,
+        )
+        .unwrap();
+
+        assert_eq!(
+            filters.start_date.as_deref(),
+            Some("2026-03-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            filters.end_date.as_deref(),
+            Some("2026-03-03T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn parse_ocpp_log_filters_with_to_only_uses_previous_seven_days() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let filters =
+            parse_ocpp_log_filters(None, None, None, Some("2026-03-03"), false, anchor).unwrap();
+
+        assert_eq!(
+            filters.start_date.as_deref(),
+            Some("2026-02-24T23:59:59.999Z")
+        );
+        assert_eq!(
+            filters.end_date.as_deref(),
+            Some("2026-03-03T23:59:59.999Z")
+        );
+    }
+
+    #[test]
+    fn parse_ocpp_log_filters_rejects_ranges_longer_than_seven_days() {
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 6, 19, 45, 53).unwrap();
+
+        let err = parse_ocpp_log_filters(
+            None,
+            None,
+            Some("2026-02-01"),
+            Some("2026-02-10"),
+            false,
+            anchor,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("7 days or less"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

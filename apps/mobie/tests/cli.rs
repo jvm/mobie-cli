@@ -312,6 +312,10 @@ async fn tokens_and_logs_queries_work() {
         .and(path("/api/logs/ocpp"))
         .and(query_param("limit", "2"))
         .and(query_param("offset", "0"))
+        .and(query_param("startDate", "2025-01-01T00:00:00.000Z"))
+        .and(query_param("endDate", "2025-01-02T23:59:59.999Z"))
+        .and(query_param("id", "MOBI-AAA-00001"))
+        .and(query_param("messageType", "Heartbeat"))
         .and(query_param("error", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [{
@@ -319,7 +323,7 @@ async fn tokens_and_logs_queries_work() {
                 "messageType": "Heartbeat",
                 "direction": "Response",
                 "timestamp": "2025-01-03T10:00:00Z",
-                "logs": "{}"
+                "logs": "{\"currentTime\":\"2025-01-03T10:00:00Z\"}"
             }],
             "status_code": 1000,
             "status_message": "Success",
@@ -332,6 +336,10 @@ async fn tokens_and_logs_queries_work() {
         .and(path("/api/logs/ocpp"))
         .and(query_param("limit", "2"))
         .and(query_param("offset", "1"))
+        .and(query_param("startDate", "2025-01-01T00:00:00.000Z"))
+        .and(query_param("endDate", "2025-01-02T23:59:59.999Z"))
+        .and(query_param("id", "MOBI-AAA-00001"))
+        .and(query_param("messageType", "Heartbeat"))
         .and(query_param("error", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [],
@@ -344,7 +352,21 @@ async fn tokens_and_logs_queries_work() {
 
     let logs = cli(&server)
         .arg("--json")
-        .args(["logs", "list", "--limit", "2", "--error-only"])
+        .args([
+            "logs",
+            "list",
+            "--limit",
+            "2",
+            "--error-only",
+            "--location",
+            "MOBI-AAA-00001",
+            "--message-type",
+            "Heartbeat",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-01-02",
+        ])
         .output()
         .expect("run mobie");
 
@@ -353,6 +375,30 @@ async fn tokens_and_logs_queries_work() {
     assert_eq!(log_body["resource"], "logs");
     assert_eq!(log_body["meta"]["count"], 1);
     assert_eq!(log_body["data"][0]["messageType"], "Heartbeat");
+}
+
+#[tokio::test]
+async fn logs_list_rejects_ranges_longer_than_seven_days() {
+    let server = MockServer::start().await;
+
+    let output = cli(&server)
+        .arg("--json")
+        .args([
+            "logs",
+            "list",
+            "--location",
+            "MOBI-AAA-00001",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-01-10",
+        ])
+        .output()
+        .expect("run mobie");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("7 days or less"), "stderr was: {stderr}");
 }
 
 #[tokio::test]

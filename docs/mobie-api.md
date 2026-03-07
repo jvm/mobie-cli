@@ -343,6 +343,10 @@ Query parameters:
 
 - `limit=<n>`
 - `offset=<n>`
+- `startDate=<RFC3339 timestamp>` optional
+- `endDate=<RFC3339 timestamp>` optional
+- `id=<location id>` optional
+- `messageType=<message type>` optional
 - `error=true` optional
 
 Response example:
@@ -377,9 +381,15 @@ Notes:
 
 - `logs` may be a stringified JSON payload or a JSON value.
 - the API `id` appears to identify the charger/location, not a unique log entry
+- the richer OCPP portal search form uses `startDate`, `endDate`, `id`, and `messageType`
+- the portal UI constrains OCPP searches to windows of 7 days or less
 - `mobie` therefore uses a synthetic local fingerprint for canonical log identity
 - local ordered reads use `timestamp` plus a deterministic sort key derived during ingestion
-- `logs list --error-only` is tracked separately in cache freshness scope from unfiltered OCPP log reads
+- `mobie logs list` defaults to:
+  - end of today when `--to` is omitted
+  - the last 7 days when both `--from` and `--to` are omitted
+- `mobie logs list` enforces a 7-day maximum window client-side
+- canonical OCPP log freshness is tracked per location, message type, error filter, and requested time window
 
 ### List OCPI Logs
 

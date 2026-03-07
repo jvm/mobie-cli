@@ -1,4 +1,4 @@
-use mobie_api::{AccessContext, MobieClient, SessionFilters};
+use mobie_api::{AccessContext, MobieClient, OcppLogFilters, SessionFilters};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -224,6 +224,11 @@ async fn sync_ocpp_logs_window_continues_until_empty_page() {
         .and(path("/api/logs/ocpp"))
         .and(query_param("limit", "2"))
         .and(query_param("offset", "0"))
+        .and(query_param("startDate", "2025-01-01T00:00:00.000Z"))
+        .and(query_param("endDate", "2025-01-07T23:59:59.999Z"))
+        .and(query_param("id", "MOBI-LSB-00693"))
+        .and(query_param("messageType", "Heartbeat"))
+        .and(query_param("error", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
                 {
@@ -250,6 +255,11 @@ async fn sync_ocpp_logs_window_continues_until_empty_page() {
         .and(path("/api/logs/ocpp"))
         .and(query_param("limit", "2"))
         .and(query_param("offset", "2"))
+        .and(query_param("startDate", "2025-01-01T00:00:00.000Z"))
+        .and(query_param("endDate", "2025-01-07T23:59:59.999Z"))
+        .and(query_param("id", "MOBI-LSB-00693"))
+        .and(query_param("messageType", "Heartbeat"))
+        .and(query_param("error", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
                 {
@@ -276,6 +286,11 @@ async fn sync_ocpp_logs_window_continues_until_empty_page() {
         .and(path("/api/logs/ocpp"))
         .and(query_param("limit", "2"))
         .and(query_param("offset", "4"))
+        .and(query_param("startDate", "2025-01-01T00:00:00.000Z"))
+        .and(query_param("endDate", "2025-01-07T23:59:59.999Z"))
+        .and(query_param("id", "MOBI-LSB-00693"))
+        .and(query_param("messageType", "Heartbeat"))
+        .and(query_param("error", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [],
             "status_code": 1000,
@@ -286,7 +301,14 @@ async fn sync_ocpp_logs_window_continues_until_empty_page() {
         .await;
 
     let mut client = authed_client(&server);
-    let logs = client.sync_ocpp_logs_window(2, false).await.unwrap();
+    let filters = OcppLogFilters {
+        start_date: Some("2025-01-01T00:00:00.000Z".into()),
+        end_date: Some("2025-01-07T23:59:59.999Z".into()),
+        location_id: Some("MOBI-LSB-00693".into()),
+        message_type: Some("Heartbeat".into()),
+        error_only: true,
+    };
+    let logs = client.sync_ocpp_logs_window(2, &filters).await.unwrap();
 
     assert_eq!(logs.len(), 4);
     assert_eq!(logs[0].timestamp.as_deref(), Some("2025-01-01T00:00:00Z"));

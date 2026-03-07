@@ -45,6 +45,13 @@ fn cli(base_url: &str, cache_dir: &std::path::Path) -> Command {
     cmd
 }
 
+fn cli_without_credentials(base_url: &str, cache_dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("mobie"));
+    cmd.env("MOBIE_BASE_URL", base_url);
+    cmd.env("MOBIE_CACHE_DIR", cache_dir);
+    cmd
+}
+
 #[tokio::test]
 async fn cache_miss_writes_sqlite_and_offline_hit_reuses_same_json_output() {
     let cache_dir = tempdir().unwrap();
@@ -407,7 +414,7 @@ async fn response_cache_policy_keeps_sessions_and_logs_canonical_state_after_sna
                 "messageType": "Heartbeat",
                 "direction": "Response",
                 "timestamp": "2025-01-03T10:00:00Z",
-                "logs": "{}"
+                "logs": "{\"currentTime\":\"2025-01-03T10:00:00Z\"}"
             }],
             "status_code": 1000,
             "status_message": "Success",
@@ -483,6 +490,241 @@ async fn response_cache_policy_keeps_sessions_and_logs_canonical_state_after_sna
     assert_eq!(session_rows, 1);
     assert_eq!(log_rows, 1);
     assert_eq!(sync_window_rows, 2);
+}
+
+#[tokio::test]
+async fn stale_session_cache_is_reused_when_refresh_fails() {
+    let cache_dir = tempdir().unwrap();
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    mock_login(&server).await;
+
+    let login = cli(&base_url, cache_dir.path())
+        .args(["auth", "login"])
+        .output()
+        .expect("seed stored session");
+    assert!(login.status.success());
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{
+                "id": "sess-1",
+                "start_date_time": "2025-01-01T10:00:00Z",
+                "end_date_time": "2025-01-01T11:00:00Z",
+                "status": "COMPLETED",
+                "location_id": "EVSE-1"
+            }],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "1"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let seeded = cli_without_credentials(&base_url, cache_dir.path())
+        .args([
+            "--json",
+            "sessions",
+            "list",
+            "--location",
+            "EVSE-1",
+            "--limit",
+            "2",
+        ])
+        .output()
+        .expect("seed sessions");
+    assert!(seeded.status.success());
+
+    let conn = Connection::open(cache_dir.path().join("cache.db")).unwrap();
+    conn.execute(
+        "UPDATE sync_windows
+         SET last_success_epoch_ms = 0
+         WHERE resource = 'sessions'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    server.reset().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let offline = cli_without_credentials(&base_url, cache_dir.path())
+        .args([
+            "--json",
+            "sessions",
+            "list",
+            "--location",
+            "EVSE-1",
+            "--limit",
+            "2",
+        ])
+        .output()
+        .expect("stale cache reuse after refresh failure");
+
+    assert!(
+        offline.status.success(),
+        "expected stale canonical cache fallback, stderr was: {}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+
+    let body: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(body["data"][0]["id"], "sess-1");
+    assert_eq!(body["meta"]["freshness"]["state"], "stale");
+}
+
+#[tokio::test]
+async fn canonical_refresh_preserves_other_profiles_rows_for_same_scope() {
+    let cache_dir = tempdir().unwrap();
+    let server = MockServer::start().await;
+    let base_url = server.uri();
+    mock_login(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{
+                "id": "sess-dpc",
+                "start_date_time": "2025-01-01T10:00:00Z",
+                "end_date_time": "2025-01-01T11:00:00Z",
+                "status": "COMPLETED",
+                "location_id": "EVSE-1"
+            }],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "1"))
+        .and(query_param("locationId", "EVSE-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let seeded = cli(&base_url, cache_dir.path())
+        .args([
+            "--json",
+            "sessions",
+            "list",
+            "--location",
+            "EVSE-1",
+            "--limit",
+            "2",
+        ])
+        .output()
+        .expect("seed canonical sessions");
+    assert!(seeded.status.success());
+
+    let conn = Connection::open(cache_dir.path().join("cache.db")).unwrap();
+    let scope: String = conn
+        .query_row(
+            "SELECT scope FROM sessions WHERE profile = 'DPC' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let mop_payload = serde_json::json!({
+        "id": "sess-mop",
+        "start_date_time": "2025-01-01T12:00:00Z",
+        "end_date_time": "2025-01-01T13:00:00Z",
+        "status": "COMPLETED",
+        "location_id": "EVSE-1"
+    })
+    .to_string();
+
+    conn.execute(
+        "INSERT INTO sessions (
+            base_url, user_email, profile, session_id, scope, payload_json, fetched_at, expires_at,
+            start_date_time, end_date_time, status, location_id, evse_uid, connector_id, token_uid, kwh
+        ) VALUES (?1, ?2, 'MOP', 'sess-mop', ?3, ?4, 1_000, 9_999_999, ?5, ?6, 'COMPLETED', 'EVSE-1', NULL, NULL, NULL, NULL)",
+        rusqlite::params![
+            base_url,
+            "user@example.com",
+            scope,
+            mop_payload,
+            "2025-01-01T12:00:00Z",
+            "2025-01-01T13:00:00Z"
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sync_windows
+         SET last_success_epoch_ms = 0
+         WHERE resource = 'sessions'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let refreshed = cli(&base_url, cache_dir.path())
+        .args([
+            "--json",
+            "sessions",
+            "list",
+            "--location",
+            "EVSE-1",
+            "--limit",
+            "2",
+        ])
+        .output()
+        .expect("refresh canonical sessions");
+    assert!(refreshed.status.success());
+
+    let conn = Connection::open(cache_dir.path().join("cache.db")).unwrap();
+    let mop_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE profile = 'MOP' AND session_id = 'sess-mop'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mop_rows, 1,
+        "refresh for one profile should not purge canonical rows for another profile with the same scope"
+    );
 }
 
 #[tokio::test]

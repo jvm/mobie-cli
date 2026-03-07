@@ -100,6 +100,7 @@ cargo run -p mobie -- sessions list --location MOBI-XXX-00000 --limit 200
 cargo run -p mobie -- sessions list --location MOBI-XXX-00000 --from 2026-03-02 --to 2026-03-08
 cargo run -p mobie -- tokens list --limit 200
 cargo run -p mobie -- logs list --limit 200 --error-only
+cargo run -p mobie -- logs list --location MOBI-LSB-00693 --message-type Heartbeat --from 2026-03-01 --to 2026-03-07
 ```
 
 Structured output for agents:
@@ -112,6 +113,16 @@ cargo run -p mobie -- --json sessions list --location MOBI-XXX-00000
 ```
 
 `sessions list --from/--to` maps to the MOBIE API's `dateFrom` / `dateTo` query params. Date-only values include the full day.
+
+`logs list` targets the richer OCPP log surface used by the portal search form. It supports optional `--location`, `--message-type`, `--from`, and `--to`.
+
+Default OCPP log window behavior:
+
+- if `--to` is omitted, `mobie` uses the end of today
+- if both `--from` and `--to` are omitted, `mobie` uses the last 7 days
+- if both are provided, `mobie` rejects ranges longer than 7 days
+
+Date-only values for `logs list` include the full day.
 
 ## Cache Behavior
 
@@ -126,6 +137,7 @@ For canonical resources:
 - full raw API documents are stored locally alongside indexed columns for querying
 - `sessions list` reads from canonical session rows after refresh
 - OCPP `logs list` reads from canonical log rows after refresh
+- OCPP log cache scopes are keyed by location, message type, error filter, and requested time window
 - `--json` and `--toon` include structured freshness metadata
 - terminal and Markdown output show a concise freshness line when available
 

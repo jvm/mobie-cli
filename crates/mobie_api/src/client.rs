@@ -18,6 +18,15 @@ pub struct SessionFilters {
     pub date_to: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OcppLogFilters {
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub location_id: Option<String>,
+    pub message_type: Option<String>,
+    pub error_only: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccessContext {
     pub user_email: String,
@@ -407,17 +416,30 @@ impl MobieClient {
         &mut self,
         limit: i64,
         offset: i64,
-        error_only: bool,
+        filters: &OcppLogFilters,
     ) -> Result<Vec<OcppLogEntry>, MobieApiError> {
-        let mut url = format!(
-            "{}/api/logs/ocpp?limit={}&offset={}",
-            self.base_url.trim_end_matches('/'),
-            limit,
-            offset
-        );
-        if error_only {
-            url.push_str("&error=true");
+        let mut params = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(start_date) = filters.start_date.as_deref() {
+            params.push(("startDate", start_date.to_string()));
         }
+        if let Some(end_date) = filters.end_date.as_deref() {
+            params.push(("endDate", end_date.to_string()));
+        }
+        if let Some(location_id) = filters.location_id.as_deref() {
+            params.push(("id", location_id.to_string()));
+        }
+        if let Some(message_type) = filters.message_type.as_deref() {
+            params.push(("messageType", message_type.to_string()));
+        }
+        if filters.error_only {
+            params.push(("error", "true".to_string()));
+        }
+        let url = Url::parse_with_params(
+            &format!("{}/api/logs/ocpp", self.base_url.trim_end_matches('/')),
+            params.iter().map(|(key, value)| (*key, value.as_str())),
+        )
+        .map_err(|err| MobieApiError::Unexpected(format!("invalid OCPP logs url: {err}")))?
+        .to_string();
         let headers = self.authed_headers().await?;
         let env: ApiEnvelope<Vec<OcppLogEntry>> = self.get_json(&url, headers).await?;
         Ok(env.data)
@@ -468,11 +490,17 @@ impl MobieClient {
     pub async fn list_ocpp_logs_paginated(
         &mut self,
         limit: i64,
-        error_only: bool,
+        filters: &OcppLogFilters,
     ) -> Result<Vec<OcppLogEntry>, MobieApiError> {
+        let filters = filters.clone();
         let mut logs = self
-            .collect_paginated(limit, |client, page_limit, offset| {
-                Box::pin(client.list_ocpp_logs_page(page_limit, offset, error_only))
+            .collect_paginated(limit, move |client, page_limit, offset| {
+                let filters = filters.clone();
+                Box::pin(async move {
+                    client
+                        .list_ocpp_logs_page(page_limit, offset, &filters)
+                        .await
+                })
             })
             .await?;
         // Reverse to show oldest first (top) and newest last (bottom)
@@ -483,16 +511,21 @@ impl MobieClient {
     pub async fn sync_ocpp_logs_window(
         &mut self,
         page_limit: i64,
-        error_only: bool,
+        filters: &OcppLogFilters,
     ) -> Result<Vec<OcppLogEntry>, MobieApiError> {
+        let filters = filters.clone();
         let mut logs = self
-            .collect_paginated_until_empty(page_limit, |client, effective_page_limit, offset| {
-                Box::pin(client.list_ocpp_logs_page(
-                    effective_page_limit,
-                    offset,
-                    error_only,
-                ))
-            })
+            .collect_paginated_until_empty(
+                page_limit,
+                move |client, effective_page_limit, offset| {
+                    let filters = filters.clone();
+                    Box::pin(async move {
+                        client
+                            .list_ocpp_logs_page(effective_page_limit, offset, &filters)
+                            .await
+                    })
+                },
+            )
             .await?;
         logs.reverse();
         Ok(logs)
