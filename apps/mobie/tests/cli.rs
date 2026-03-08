@@ -510,13 +510,14 @@ fn locations_get_without_location_or_config_shows_terminal_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("location is mandatory"),
+        stderr.contains("command requires a location argument"),
         "stderr was: {stderr}"
     );
     assert!(
         stderr.contains("mobie location <LOCATION_ID>"),
         "stderr was: {stderr}"
     );
+    assert!(!stderr.contains("config.toml"), "stderr was: {stderr}");
 }
 
 #[tokio::test]
@@ -668,4 +669,11 @@ fn help_mentions_toon_for_agents() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--toon"));
     assert!(stdout.contains("preferred structured format for agents"));
+    assert!(stdout.contains("Lookup one entity; accepts optional CODE"));
+    assert!(stdout.contains("Lookup one role; accepts optional ROLE_NAME"));
+    assert!(stdout.contains("Lookup one location; accepts optional LOCATION_ID"));
+    assert!(
+        stdout
+            .contains("List sessions; requires LOCATION_ID unless default_location is configured")
+    );
 }

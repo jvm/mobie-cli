@@ -151,7 +151,7 @@ Homebrew releases are driven by Git tags:
 
 1. Update `apps/mobie/Cargo.toml` to the release version.
 2. Commit the change and push it.
-3. Create and push a matching tag like `v0.3.0`.
+3. Create and push a matching tag like `v0.3.1`.
 
 That tag triggers GitHub Actions to:
 

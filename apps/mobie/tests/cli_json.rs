@@ -254,7 +254,7 @@ fn locations_get_without_location_or_config_is_structured_json_error() {
         value["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("location is mandatory")
+            .contains("command requires a location argument")
     );
 }
 

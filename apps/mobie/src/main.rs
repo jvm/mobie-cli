@@ -120,32 +120,41 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Authentication commands; no positional arguments")]
     Auth {
         #[command(subcommand)]
         command: Option<AuthCommand>,
     },
+    #[command(about = "Lookup one entity; accepts optional CODE")]
     Entity {
         /// Entity code.
         code: Option<String>,
     },
+    #[command(about = "Lookup one role; accepts optional ROLE_NAME")]
     Role {
         /// Role name.
         role: Option<String>,
     },
+    #[command(about = "Lookup one location; accepts optional LOCATION_ID")]
     Location {
         /// Location id. Falls back to default_location from config.toml when omitted.
         location: Option<String>,
     },
+    #[command(about = "Location list and analytics commands; no positional arguments")]
     Locations {
         #[command(subcommand)]
         command: Option<LocationCommand>,
     },
+    #[command(about = "ORD list and statistics commands; no positional arguments")]
     Ords {
         #[command(subcommand)]
         command: Option<OrdCommand>,
     },
+    #[command(about = "List sessions; requires LOCATION_ID unless default_location is configured")]
     Sessions(SessionArgs),
+    #[command(about = "List tokens; no positional arguments")]
     Tokens(TokenArgs),
+    #[command(about = "List logs; no positional arguments, optional subcommand")]
     Logs {
         #[command(subcommand)]
         command: Option<LogCommand>,
@@ -751,7 +760,7 @@ async fn execute_location_lookup<S: SessionStore>(
     let location = resolve_required_location(
         location,
         config,
-        "location is mandatory (pass `mobie location <LOCATION_ID>` or configure default_location in ~/.config/mobie/config.toml)",
+        "command requires a location argument (pass `mobie location <LOCATION_ID>`)",
     )?;
     Ok(Output::Location(
         cached_fetch(
