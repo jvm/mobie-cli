@@ -667,13 +667,14 @@ fn help_mentions_toon_for_agents() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("--toon"));
-    assert!(stdout.contains("preferred structured format for agents"));
-    assert!(stdout.contains("Lookup one entity; accepts optional CODE"));
-    assert!(stdout.contains("Lookup one role; accepts optional ROLE_NAME"));
-    assert!(stdout.contains("Lookup one location; accepts optional LOCATION_ID"));
-    assert!(
-        stdout
-            .contains("List sessions; requires LOCATION_ID unless default_location is configured")
-    );
+    for expected in [
+        "--toon",
+        "preferred structured format for agents",
+        "Lookup one entity; accepts optional CODE",
+        "Lookup one role; accepts optional ROLE_NAME",
+        "Lookup one location; accepts optional LOCATION_ID",
+        "List sessions; requires LOCATION_ID unless default_location is configured",
+    ] {
+        assert!(stdout.contains(expected), "missing help text: {expected}");
+    }
 }
