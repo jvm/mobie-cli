@@ -59,9 +59,11 @@ Specific expectations:
 - Homebrew releases are driven by Git tags in `jvm/mobie-cli`.
 - The release version source of truth is `apps/mobie/Cargo.toml`.
 - Release tags must match that version exactly, using the `vX.Y.Z` format.
+- Create the release commit first, verify `git rev-parse HEAD` matches `git rev-parse vX.Y.Z`, and only then push the tag. Do not create the commit and tag in parallel.
 - Pushing a matching tag triggers `.github/workflows/release.yml`.
 - That workflow builds macOS `aarch64-apple-darwin` and `x86_64-apple-darwin` archives, creates the GitHub release, and dispatches the asset metadata to `jvm/homebrew-tap`.
 - The helper scripts for that flow are `scripts/mobie-version.sh` and `scripts/package-release.sh`.
 - `jvm/homebrew-tap` listens for the `mobie_release` repository dispatch event and regenerates `Formula/mobie.rb`.
 - `HOMEBREW_TAP_DISPATCH_TOKEN` must exist in the `jvm/mobie-cli` repository secrets for the dispatch step to work.
+- A release is not complete until the downstream `jvm/homebrew-tap` update is verified and Homebrew sees the new version (`brew info mobie` or equivalent).
 - When changing release packaging, keep the archive naming stable: `mobie-v<version>-<target>.tar.gz`.
