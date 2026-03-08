@@ -1602,6 +1602,24 @@ fn password_supplied_via_argv() -> bool {
 }
 
 fn collect_login_credentials(cli: &Cli) -> Result<(String, String), AppError> {
+    if has_explicit_credentials(cli) {
+        let email = cli
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(AppError::MissingCredential("MOBIE_EMAIL", "email"))?
+            .to_string();
+        let password = cli
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(AppError::MissingCredential("MOBIE_PASSWORD", "password"))?
+            .to_string();
+        return Ok((email, password));
+    }
+
     let email = match cli
         .email
         .as_deref()
@@ -3371,6 +3389,31 @@ mod tests {
         let persisted = store.load(&server.uri()).unwrap().unwrap();
         assert_eq!(persisted.access.access_token, "new-token");
         assert_eq!(persisted.access.refresh_token.as_deref(), Some("refresh-2"));
+    }
+
+    #[test]
+    fn auth_login_with_partial_explicit_credentials_is_non_interactive_and_fails() {
+        let err = collect_login_credentials(&Cli {
+            base_url: "https://pgm.mobie.pt".into(),
+            email: Some("user@example.com".into()),
+            password: None,
+            json: true,
+            markdown: false,
+            toon: false,
+            pretty: false,
+            command: Command::Auth {
+                command: AuthCommand::Login,
+            },
+        })
+        .unwrap_err();
+
+        match err {
+            AppError::MissingCredential(name, flag) => {
+                assert_eq!(name, "MOBIE_PASSWORD");
+                assert_eq!(flag, "password");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

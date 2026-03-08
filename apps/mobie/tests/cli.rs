@@ -54,6 +54,25 @@ async fn auth_check_json_reports_identity() {
 }
 
 #[tokio::test]
+async fn auth_login_uses_env_credentials_without_stdin() {
+    let server = MockServer::start().await;
+    mount_login(&server).await;
+
+    let output = cli(&server)
+        .arg("--json")
+        .args(["auth", "login"])
+        .output()
+        .expect("run mobie");
+
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["resource"], "auth");
+    assert_eq!(body["data"]["source"], "login");
+    assert_eq!(body["data"]["email"], "user@example.com");
+}
+
+#[tokio::test]
 async fn locations_list_json_returns_counted_array() {
     let server = MockServer::start().await;
     mount_login(&server).await;

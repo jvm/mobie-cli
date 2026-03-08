@@ -393,7 +393,7 @@ impl MobieClient {
                 .await
             {
                 Ok(page) => page,
-                Err(err) if effective_page_limit > 50 => {
+                Err(_) if effective_page_limit > 50 => {
                     effective_page_limit = 50;
                     continue;
                 }
@@ -640,7 +640,7 @@ impl MobieClient {
         loop {
             let page = match fetch_page(self, page_limit, offset).await {
                 Ok(page) => page,
-                Err(err) if page_limit > 50 => {
+                Err(_) if page_limit > 50 => {
                     page_limit = 50;
                     continue;
                 }
@@ -685,7 +685,7 @@ impl MobieClient {
         loop {
             let page = match fetch_page(self, effective_page_limit, offset).await {
                 Ok(page) => page,
-                Err(err) if effective_page_limit > 50 => {
+                Err(_) if effective_page_limit > 50 => {
                     effective_page_limit = 50;
                     continue;
                 }
