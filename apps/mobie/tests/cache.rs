@@ -77,7 +77,7 @@ async fn cache_miss_writes_sqlite_and_offline_hit_reuses_same_json_output() {
         .await;
 
     let first = cli(&base_url, cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("first run");
     assert!(first.status.success());
@@ -88,7 +88,7 @@ async fn cache_miss_writes_sqlite_and_offline_hit_reuses_same_json_output() {
     drop(server);
 
     let second = cli(&base_url, cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("second run");
     assert!(second.status.success());
@@ -116,7 +116,7 @@ async fn schema_contains_cache_meta_and_sync_windows() {
         .await;
 
     let output = cli(&base_url, cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("seed run");
     assert!(output.status.success());
@@ -234,15 +234,7 @@ async fn different_query_parameters_create_distinct_cache_entries() {
         .await;
 
     let first = cli(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "LOC-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "LOC-1", "--limit", "2"])
         .output()
         .expect("first query");
     assert!(first.status.success());
@@ -251,8 +243,6 @@ async fn different_query_parameters_create_distinct_cache_entries() {
         .args([
             "--json",
             "sessions",
-            "list",
-            "--location",
             "LOC-1",
             "--limit",
             "2",
@@ -297,7 +287,7 @@ async fn cache_entries_do_not_cross_user_or_base_url_boundaries() {
         .await;
 
     let seeded = cli(&base_url, cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("seed run");
     assert!(seeded.status.success());
@@ -309,7 +299,7 @@ async fn cache_entries_do_not_cross_user_or_base_url_boundaries() {
         .env("MOBIE_EMAIL", "other@example.com")
         .env("MOBIE_PASSWORD", "password")
         .env("MOBIE_CACHE_DIR", cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("different user run");
     assert!(!different_user.status.success());
@@ -319,7 +309,7 @@ async fn cache_entries_do_not_cross_user_or_base_url_boundaries() {
         .env("MOBIE_EMAIL", "user@example.com")
         .env("MOBIE_PASSWORD", "password")
         .env("MOBIE_CACHE_DIR", cache_dir.path())
-        .args(["--json", "locations", "list"])
+        .args(["--json", "locations"])
         .output()
         .expect("different base run");
     assert!(!different_base.status.success());
@@ -352,7 +342,7 @@ async fn unwritable_cache_directory_degrades_to_live_fetch_with_terminal_warning
         .env("MOBIE_EMAIL", "user@example.com")
         .env("MOBIE_PASSWORD", "password")
         .env("MOBIE_CACHE_DIR", &blocked_path)
-        .args(["locations", "list"])
+        .args(["locations"])
         .output()
         .expect("warning run");
 
@@ -440,21 +430,13 @@ async fn response_cache_policy_keeps_sessions_and_logs_canonical_state_after_sna
         .await;
 
     let sessions_seed = cli(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "EVSE-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("seed sessions");
     assert!(sessions_seed.status.success());
 
     let logs_seed = cli(&base_url, cache_dir.path())
-        .args(["--json", "logs", "list", "--limit", "2", "--error-only"])
+        .args(["--json", "logs", "--limit", "2", "--error-only"])
         .output()
         .expect("seed logs");
     assert!(logs_seed.status.success());
@@ -542,15 +524,7 @@ async fn stale_session_cache_is_reused_when_refresh_fails() {
         .await;
 
     let seeded = cli_without_credentials(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "EVSE-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("seed sessions");
     assert!(seeded.status.success());
@@ -577,15 +551,7 @@ async fn stale_session_cache_is_reused_when_refresh_fails() {
         .await;
 
     let offline = cli_without_credentials(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "EVSE-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("stale cache reuse after refresh failure");
 
@@ -644,15 +610,7 @@ async fn canonical_refresh_preserves_other_profiles_rows_for_same_scope() {
         .await;
 
     let seeded = cli(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "EVSE-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("seed canonical sessions");
     assert!(seeded.status.success());
@@ -700,15 +658,7 @@ async fn canonical_refresh_preserves_other_profiles_rows_for_same_scope() {
     drop(conn);
 
     let refreshed = cli(&base_url, cache_dir.path())
-        .args([
-            "--json",
-            "sessions",
-            "list",
-            "--location",
-            "EVSE-1",
-            "--limit",
-            "2",
-        ])
+        .args(["--json", "sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("refresh canonical sessions");
     assert!(refreshed.status.success());
@@ -815,7 +765,7 @@ async fn migration_backfills_canonical_tables_from_legacy_cache_entries() {
         .env("MOBIE_EMAIL", "user@example.com")
         .env("MOBIE_PASSWORD", "password")
         .env("MOBIE_CACHE_DIR", cache_dir.path())
-        .args(["--json", "tokens", "list", "--limit", "1"])
+        .args(["--json", "tokens", "--limit", "1"])
         .output()
         .expect("migrated token read");
     assert!(output.status.success());

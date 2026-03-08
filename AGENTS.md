@@ -1,5 +1,24 @@
 # Repository Agent Notes
 
+## Mandatory Sanity Checks
+
+Whenever the codebase is changed, agents must run this verification loop before closing the task:
+
+- `cargo fmt --check`
+- `cargo check -p mobie`
+- `cargo test -p mobie`
+- `cargo clippy -p mobie --all-targets -- -D warnings`
+- `/bin/zsh -lc "CARGO_HOME=/tmp/cargo-home cargo audit"`
+- `/bin/zsh -lc "CARGO_HOME=/tmp/cargo-home cargo deny check advisories bans sources licenses"`
+- `/bin/zsh -lc "TMPDIR=/tmp semgrep --config auto ."`
+
+Rules:
+
+- Treat all failures as blockers unless the user explicitly says otherwise.
+- Do not skip `cargo clippy` or the security checks just because `cargo test` passed.
+- If a command cannot be run, state that explicitly and explain why in the final handoff.
+- If a change only touches documentation or other clearly non-code files, say that and note which checks were intentionally not run.
+
 ## CLI Output Rules
 
 When changing or adding `mobie` CLI commands:

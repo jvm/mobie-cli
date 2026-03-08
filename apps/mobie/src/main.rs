@@ -1,7 +1,9 @@
 mod cache;
 mod session_store;
 
+use std::fs;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration as StdDuration;
@@ -11,9 +13,10 @@ use cache::{
     SessionQuery as CacheSessionQuery,
 };
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, OcppLogFilters, SessionFilters};
 use mobie_models::{LocationDetail, LocationSummary, OcppLogEntry, Session, TokenInfo};
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -90,8 +93,8 @@ struct Cli {
     #[arg(long, env = "MOBIE_EMAIL", hide_env_values = true)]
     email: Option<String>,
 
-    /// MOBIE account password from MOBIE_PASSWORD or dotenvx. Passing --password is rejected.
-    #[arg(long, env = "MOBIE_PASSWORD", hide_env_values = true)]
+    /// MOBIE account password from MOBIE_PASSWORD or dotenvx.
+    #[arg(skip = None)]
     password: Option<String>,
 
     /// Emit JSON for scripts and integrations.
@@ -106,7 +109,7 @@ struct Cli {
     #[arg(long, global = true, conflicts_with_all = ["json", "markdown"])]
     toon: bool,
 
-    #[arg(long, global = true)]
+    #[arg(long, global = true, requires = "json")]
     pretty: bool,
 
     #[command(subcommand)]
@@ -117,35 +120,36 @@ struct Cli {
 enum Command {
     Auth {
         #[command(subcommand)]
-        command: AuthCommand,
+        command: Option<AuthCommand>,
     },
-    Entities {
-        #[command(subcommand)]
-        command: EntityCommand,
+    Entity {
+        /// Entity code.
+        code: String,
     },
-    Roles {
-        #[command(subcommand)]
-        command: RoleCommand,
+    Role {
+        /// Role code.
+        role: String,
+    },
+    Location {
+        /// Location id. Falls back to default_location from config.toml when omitted.
+        location: Option<String>,
     },
     Locations {
         #[command(subcommand)]
-        command: LocationCommand,
+        command: Option<LocationCommand>,
     },
     Ords {
         #[command(subcommand)]
-        command: OrdCommand,
+        command: Option<OrdCommand>,
     },
-    Sessions {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
-    Tokens {
-        #[command(subcommand)]
-        command: TokenCommand,
-    },
+    Sessions(SessionArgs),
+    Tokens(TokenArgs),
     Logs {
         #[command(subcommand)]
-        command: LogCommand,
+        command: Option<LogCommand>,
+
+        #[command(flatten)]
+        list: LogListArgs,
     },
 }
 
@@ -159,93 +163,69 @@ enum AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum LocationCommand {
-    List,
-    Get {
-        #[arg(long)]
-        location: String,
-    },
     Analytics,
     Geojson,
 }
 
 #[derive(Debug, Subcommand)]
-enum EntityCommand {
-    Get {
-        #[arg(long)]
-        code: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum RoleCommand {
-    Get {
-        #[arg(long)]
-        role: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum OrdCommand {
-    List,
     Statistics,
     CpesIntegrated,
     CpesToIntegrate,
 }
 
 #[derive(Debug, Subcommand)]
-enum SessionCommand {
-    List {
-        #[arg(long)]
-        location: String,
-
-        #[arg(long, default_value_t = 200)]
-        limit: i64,
-
-        /// Inclusive range start: year (2026), date (2026-03-02 or 02-03-2026), or RFC3339 timestamp.
-        #[arg(long)]
-        from: Option<String>,
-
-        /// Exclusive range end for timestamps; date/year values expand to the next day/year.
-        #[arg(long)]
-        to: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum TokenCommand {
-    List {
-        #[arg(long, default_value_t = 200)]
-        limit: i64,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum LogCommand {
-    List {
-        #[arg(long, default_value_t = 200)]
-        limit: i64,
-
-        #[arg(long)]
-        location: Option<String>,
-
-        #[arg(long)]
-        message_type: Option<String>,
-
-        /// Inclusive range start: year (2026), date (2026-03-02 or 02-03-2026), or RFC3339 timestamp.
-        #[arg(long)]
-        from: Option<String>,
-
-        /// Inclusive range end for dates; RFC3339 timestamps are used as-is.
-        #[arg(long)]
-        to: Option<String>,
-
-        #[arg(long, default_value_t = false)]
-        error_only: bool,
-    },
     Ocpi {
         #[arg(long, default_value_t = 200)]
         limit: i64,
     },
+}
+
+#[derive(Debug, Args)]
+struct SessionArgs {
+    /// Location id. Falls back to default_location from config.toml when omitted.
+    location: Option<String>,
+
+    #[arg(long, default_value_t = 200)]
+    limit: i64,
+
+    /// Inclusive range start: year (2026), date (2026-03-02 or 02-03-2026), or RFC3339 timestamp.
+    #[arg(long)]
+    from: Option<String>,
+
+    /// Exclusive range end for timestamps; date/year values expand to the next day/year.
+    #[arg(long)]
+    to: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TokenArgs {
+    #[arg(long, default_value_t = 200)]
+    limit: i64,
+}
+
+#[derive(Debug, Args, Default)]
+struct LogListArgs {
+    #[arg(long, default_value_t = 200)]
+    limit: i64,
+
+    #[arg(long)]
+    location: Option<String>,
+
+    #[arg(long)]
+    message_type: Option<String>,
+
+    /// Inclusive range start: year (2026), date (2026-03-02 or 02-03-2026), or RFC3339 timestamp.
+    #[arg(long)]
+    from: Option<String>,
+
+    /// Inclusive range end for dates; RFC3339 timestamps are used as-is.
+    #[arg(long)]
+    to: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    error_only: bool,
 }
 
 #[derive(Debug, Error)]
@@ -343,6 +323,12 @@ struct FreshnessMeta {
     scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    default_location: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -499,20 +485,6 @@ async fn main() -> ExitCode {
     let store = KeyringSessionStore;
     let mut cache = CacheHandle::new();
 
-    if password_supplied_via_argv() {
-        render_error(
-            &cli,
-            &ErrorPayload {
-                kind: "invalid_input",
-                message: "refusing --password on the command line; use MOBIE_PASSWORD, dotenvx, or the interactive prompt".into(),
-                status: None,
-                url: None,
-                body: None,
-            },
-        );
-        return ExitCode::from(1);
-    }
-
     match execute_with_store(&cli, &store, &mut cache).await {
         Ok(output) => match render_output(&cli, &output) {
             Ok(()) => ExitCode::SUCCESS,
@@ -542,36 +514,46 @@ async fn execute_with_store<S: SessionStore>(
     store: &S,
     cache: &mut CacheHandle,
 ) -> Result<Output, AppError> {
+    let config = load_app_config()?;
+
     match &cli.command {
-        Command::Auth { command } => execute_auth_command(cli, command, store).await,
-        Command::Entities { command } => {
+        Command::Auth { command } => {
+            execute_auth_command(cli, command.as_ref().unwrap_or(&AuthCommand::Status), store).await
+        }
+        Command::Entity { code } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_entity_command(&mut authed.client, command).await?;
+            let output = execute_entity_command(&mut authed.client, code).await?;
             persist_session_if_needed(store, cli, &authed)?;
             Ok(output)
         }
-        Command::Roles { command } => {
+        Command::Role { role } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_role_command(&mut authed.client, command).await?;
+            let output = execute_role_command(&mut authed.client, role).await?;
             persist_session_if_needed(store, cli, &authed)?;
             Ok(output)
+        }
+        Command::Location { location } => {
+            execute_location_lookup(cli, store, cache, location.as_deref(), &config).await
         }
         Command::Locations { command } => {
-            execute_cached_location_command(cli, store, cache, command).await
+            execute_cached_location_command(cli, store, cache, command.as_ref(), &config).await
         }
         Command::Ords { command } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_ord_command(&mut authed.client, command).await?;
+            let output = match command.as_ref() {
+                Some(command) => execute_ord_command(&mut authed.client, command).await?,
+                None => Output::JsonArray("ords", authed.client.list_ords().await?),
+            };
             persist_session_if_needed(store, cli, &authed)?;
             Ok(output)
         }
-        Command::Sessions { command } => {
-            execute_cached_session_command(cli, store, cache, command).await
+        Command::Sessions(args) => {
+            execute_cached_session_command(cli, store, cache, args, &config).await
         }
-        Command::Tokens { command } => {
-            execute_cached_token_command(cli, store, cache, command).await
+        Command::Tokens(args) => execute_cached_token_command(cli, store, cache, args).await,
+        Command::Logs { command, list } => {
+            execute_cached_log_command(cli, store, cache, command.as_ref(), list).await
         }
-        Command::Logs { command } => execute_cached_log_command(cli, store, cache, command).await,
     }
 }
 
@@ -641,10 +623,11 @@ async fn execute_cached_location_command<S: SessionStore>(
     cli: &Cli,
     store: &S,
     cache: &mut CacheHandle,
-    command: &LocationCommand,
+    command: Option<&LocationCommand>,
+    _config: &AppConfig,
 ) -> Result<Output, AppError> {
     match command {
-        LocationCommand::List => Ok(Output::Locations(
+        None => Ok(Output::Locations(
             cached_fetch(
                 cli,
                 store,
@@ -660,28 +643,7 @@ async fn execute_cached_location_command<S: SessionStore>(
             )
             .await?,
         )),
-        LocationCommand::Get { location } => {
-            let location = location.clone();
-            Ok(Output::Location(
-                cached_fetch(
-                    cli,
-                    store,
-                    cache,
-                    CacheSpec {
-                        resource: "location",
-                        ttl: location_detail_ttl(),
-                        params: vec![("location", location.clone())],
-                    },
-                    move |client| {
-                        Box::pin(async move {
-                            client.get_location(&location).await.map_err(AppError::from)
-                        })
-                    },
-                )
-                .await?,
-            ))
-        }
-        LocationCommand::Analytics => Ok(Output::JsonObject(
+        Some(LocationCommand::Analytics) => Ok(Output::JsonObject(
             "location_analytics",
             cached_fetch(
                 cli,
@@ -703,7 +665,7 @@ async fn execute_cached_location_command<S: SessionStore>(
             )
             .await?,
         )),
-        LocationCommand::Geojson => Ok(Output::JsonObject(
+        Some(LocationCommand::Geojson) => Ok(Output::JsonObject(
             "location_geojson",
             cached_fetch(
                 cli,
@@ -725,224 +687,241 @@ async fn execute_cached_location_command<S: SessionStore>(
     }
 }
 
+async fn execute_location_lookup<S: SessionStore>(
+    cli: &Cli,
+    store: &S,
+    cache: &mut CacheHandle,
+    location: Option<&str>,
+    config: &AppConfig,
+) -> Result<Output, AppError> {
+    let location = resolve_required_location(
+        location,
+        config,
+        "location is mandatory (pass `mobie location <LOCATION_ID>` or configure default_location in ~/.config/mobie/config.toml)",
+    )?;
+    Ok(Output::Location(
+        cached_fetch(
+            cli,
+            store,
+            cache,
+            CacheSpec {
+                resource: "location",
+                ttl: location_detail_ttl(),
+                params: vec![("location", location.clone())],
+            },
+            move |client| {
+                Box::pin(
+                    async move { client.get_location(&location).await.map_err(AppError::from) },
+                )
+            },
+        )
+        .await?,
+    ))
+}
+
 async fn execute_cached_session_command<S: SessionStore>(
     cli: &Cli,
     store: &S,
     cache: &mut CacheHandle,
-    command: &SessionCommand,
+    args: &SessionArgs,
+    config: &AppConfig,
 ) -> Result<Output, AppError> {
-    match command {
-        SessionCommand::List {
-            location,
-            limit,
-            from,
-            to,
-        } => {
-            debug_assert!(matches!(
-                cache_resource_strategy("sessions"),
-                CacheResourceStrategy::CanonicalRecords
-            ));
-            let location = location.clone();
-            let limit = *limit;
-            let filters = parse_session_filters(from.as_deref(), to.as_deref())?;
-            let plan = session_query_plan(&location, limit, &filters, Utc::now());
-            let session_query = CacheSessionQuery {
-                location_id: plan.query.location_id.clone(),
-                from: plan.query.date_from.clone(),
-                to: plan.query.date_to.clone(),
-                limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
-                oldest_first: matches!(plan.query.order, SessionQueryOrder::OldestFirst),
-            };
-            let spec = CacheSpec {
-                resource: "sessions",
-                ttl: sessions_ttl(),
-                params: session_cache_params(&location, limit, &filters),
-            };
-            let mut lookup = cache_lookup(cli, store)?;
-            if lookup.profile.is_none() {
-                match cache.infer_profile(&lookup) {
-                    Ok(Some(profile)) => lookup.profile = Some(profile),
-                    Ok(None) => {}
-                    Err(err) => cache_warn(cli, cache, &err),
-                }
-            }
-            cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
+    debug_assert!(matches!(
+        cache_resource_strategy("sessions"),
+        CacheResourceStrategy::CanonicalRecords
+    ));
+    let location = resolve_required_location(
+        args.location.as_deref(),
+        config,
+        "location is mandatory (pass `mobie sessions <LOCATION_ID>` or configure default_location in ~/.config/mobie/config.toml)",
+    )?;
+    let limit = args.limit;
+    let filters = parse_session_filters(args.from.as_deref(), args.to.as_deref())?;
+    let plan = session_query_plan(&location, limit, &filters, Utc::now());
+    let session_query = CacheSessionQuery {
+        location_id: plan.query.location_id.clone(),
+        from: plan.query.date_from.clone(),
+        to: plan.query.date_to.clone(),
+        limit: usize::try_from(plan.query.limit).unwrap_or(usize::MAX),
+        oldest_first: matches!(plan.query.order, SessionQueryOrder::OldestFirst),
+    };
+    let spec = CacheSpec {
+        resource: "sessions",
+        ttl: sessions_ttl(),
+        params: session_cache_params(&location, limit, &filters),
+    };
+    let mut lookup = cache_lookup(cli, store)?;
+    if lookup.profile.is_none() {
+        match cache.infer_profile(&lookup) {
+            Ok(Some(profile)) => lookup.profile = Some(profile),
+            Ok(None) => {}
+            Err(err) => cache_warn(cli, cache, &err),
+        }
+    }
+    cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 
-            let needs_refresh = match (
-                lookup.user_email.as_deref(),
-                lookup.profile.as_deref(),
-                cache.get_sync_window(
-                    "sessions",
-                    &plan.scope,
-                    Some(&plan.refresh.window_start),
-                    Some(&plan.refresh.window_end),
-                ),
-            ) {
-                (Some(_), Some(_), Ok(Some(window))) => {
-                    !window.is_fresh_at(current_epoch_ms(), sessions_ttl())
-                }
-                _ => true,
-            };
+    let needs_refresh = match (
+        lookup.user_email.as_deref(),
+        lookup.profile.as_deref(),
+        cache.get_sync_window(
+            "sessions",
+            &plan.scope,
+            Some(&plan.refresh.window_start),
+            Some(&plan.refresh.window_end),
+        ),
+    ) {
+        (Some(_), Some(_), Ok(Some(window))) => {
+            !window.is_fresh_at(current_epoch_ms(), sessions_ttl())
+        }
+        _ => true,
+    };
 
-            if needs_refresh {
-                let mut authed = resolve_authenticated_client(cli, store).await?;
-                match authed
-                    .client
-                    .sync_sessions_window(&location, limit, &filters)
-                    .await
-                {
-                    Ok(data) => {
-                        persist_session_if_needed(store, cli, &authed)?;
+    if needs_refresh {
+        let mut authed = resolve_authenticated_client(cli, store).await?;
+        match authed
+            .client
+            .sync_sessions_window(&location, limit, &filters)
+            .await
+        {
+            Ok(data) => {
+                persist_session_if_needed(store, cli, &authed)?;
 
-                        if let Some(access) = authed.client.access_context() {
-                            lookup = CacheLookup {
-                                base_url: canonical_base_url(&cli.base_url),
-                                user_email: Some(access.user_email.clone()),
-                                profile: Some(access.profile.clone()),
-                            };
-                            if let Err(err) = cache.put(&lookup, &spec, &data) {
-                                cache_warn(cli, cache, &err);
-                            }
-                            if let Err(err) = cache.record_sync_success(
-                                "sessions",
-                                &plan.scope,
-                                Some(&plan.refresh.window_start),
-                                Some(&plan.refresh.window_end),
-                                current_epoch_ms(),
-                            ) {
-                                cache_warn(cli, cache, &err);
-                            }
-                        }
+                if let Some(access) = authed.client.access_context() {
+                    lookup = CacheLookup {
+                        base_url: canonical_base_url(&cli.base_url),
+                        user_email: Some(access.user_email.clone()),
+                        profile: Some(access.profile.clone()),
+                    };
+                    if let Err(err) = cache.put(&lookup, &spec, &data) {
+                        cache_warn(cli, cache, &err);
                     }
-                    Err(err) => {
-                        if authed.client.access_context().is_some() {
-                            let error_json =
-                                serde_json::json!({ "message": err.to_string() }).to_string();
-                            if let e @ Err(_) = cache.record_sync_failure(
-                                "sessions",
-                                &plan.scope,
-                                Some(&plan.refresh.window_start),
-                                Some(&plan.refresh.window_end),
-                                current_epoch_ms(),
-                                &error_json,
-                            ) {
-                                cache_warn(cli, cache, &e.unwrap_err());
-                            }
-                        }
-
-                        let sessions = cache
-                            .read_sessions(&lookup, &session_query)
-                            .map_err(AppError::InvalidInput)?;
-                        if !sessions.is_empty() {
-                            let freshness = freshness_from_window(
-                                cache
-                                    .get_sync_window(
-                                        "sessions",
-                                        &plan.scope,
-                                        Some(&plan.refresh.window_start),
-                                        Some(&plan.refresh.window_end),
-                                    )
-                                    .ok()
-                                    .flatten()
-                                    .as_ref(),
-                                sessions_ttl(),
-                                plan.scope.clone(),
-                                current_epoch_ms(),
-                            );
-                            return Ok(Output::Sessions(sessions, freshness));
-                        }
-                        return Err(AppError::from(err));
-                    }
-                }
-            }
-
-            let freshness = freshness_from_window(
-                cache
-                    .get_sync_window(
+                    if let Err(err) = cache.record_sync_success(
                         "sessions",
                         &plan.scope,
                         Some(&plan.refresh.window_start),
                         Some(&plan.refresh.window_end),
-                    )
-                    .ok()
-                    .flatten()
-                    .as_ref(),
-                sessions_ttl(),
-                plan.scope.clone(),
-                current_epoch_ms(),
-            );
+                        current_epoch_ms(),
+                    ) {
+                        cache_warn(cli, cache, &err);
+                    }
+                }
+            }
+            Err(err) => {
+                if authed.client.access_context().is_some() {
+                    let error_json = serde_json::json!({ "message": err.to_string() }).to_string();
+                    if let e @ Err(_) = cache.record_sync_failure(
+                        "sessions",
+                        &plan.scope,
+                        Some(&plan.refresh.window_start),
+                        Some(&plan.refresh.window_end),
+                        current_epoch_ms(),
+                        &error_json,
+                    ) {
+                        cache_warn(cli, cache, &e.unwrap_err());
+                    }
+                }
 
-            Ok(Output::Sessions(
-                cache
+                let sessions = cache
                     .read_sessions(&lookup, &session_query)
-                    .map_err(AppError::InvalidInput)?,
-                freshness,
-            ))
+                    .map_err(AppError::InvalidInput)?;
+                if !sessions.is_empty() {
+                    let freshness = freshness_from_window(
+                        cache
+                            .get_sync_window(
+                                "sessions",
+                                &plan.scope,
+                                Some(&plan.refresh.window_start),
+                                Some(&plan.refresh.window_end),
+                            )
+                            .ok()
+                            .flatten()
+                            .as_ref(),
+                        sessions_ttl(),
+                        plan.scope.clone(),
+                        current_epoch_ms(),
+                    );
+                    return Ok(Output::Sessions(sessions, freshness));
+                }
+                return Err(AppError::from(err));
+            }
         }
     }
+
+    let freshness = freshness_from_window(
+        cache
+            .get_sync_window(
+                "sessions",
+                &plan.scope,
+                Some(&plan.refresh.window_start),
+                Some(&plan.refresh.window_end),
+            )
+            .ok()
+            .flatten()
+            .as_ref(),
+        sessions_ttl(),
+        plan.scope.clone(),
+        current_epoch_ms(),
+    );
+
+    Ok(Output::Sessions(
+        cache
+            .read_sessions(&lookup, &session_query)
+            .map_err(AppError::InvalidInput)?,
+        freshness,
+    ))
 }
 
 async fn execute_cached_token_command<S: SessionStore>(
     cli: &Cli,
     store: &S,
     cache: &mut CacheHandle,
-    command: &TokenCommand,
+    args: &TokenArgs,
 ) -> Result<Output, AppError> {
-    match command {
-        TokenCommand::List { limit } => {
-            let limit = *limit;
-            Ok(Output::Tokens(
-                cached_fetch(
-                    cli,
-                    store,
-                    cache,
-                    CacheSpec {
-                        resource: "tokens",
-                        ttl: tokens_ttl(),
-                        params: vec![("limit", limit.to_string())],
-                    },
-                    move |client| {
-                        Box::pin(async move {
-                            client
-                                .list_tokens_paginated(limit)
-                                .await
-                                .map_err(AppError::from)
-                        })
-                    },
-                )
-                .await?,
-            ))
-        }
-    }
+    let limit = args.limit;
+    Ok(Output::Tokens(
+        cached_fetch(
+            cli,
+            store,
+            cache,
+            CacheSpec {
+                resource: "tokens",
+                ttl: tokens_ttl(),
+                params: vec![("limit", limit.to_string())],
+            },
+            move |client| {
+                Box::pin(async move {
+                    client
+                        .list_tokens_paginated(limit)
+                        .await
+                        .map_err(AppError::from)
+                })
+            },
+        )
+        .await?,
+    ))
 }
 
 async fn execute_cached_log_command<S: SessionStore>(
     cli: &Cli,
     store: &S,
     cache: &mut CacheHandle,
-    command: &LogCommand,
+    command: Option<&LogCommand>,
+    list: &LogListArgs,
 ) -> Result<Output, AppError> {
     match command {
-        LogCommand::List {
-            limit,
-            location,
-            message_type,
-            from,
-            to,
-            error_only,
-        } => {
+        None => {
             debug_assert!(matches!(
                 cache_resource_strategy("logs"),
                 CacheResourceStrategy::CanonicalRecords
             ));
-            let limit = *limit;
-            let error_only = *error_only;
+            let limit = list.limit;
+            let error_only = list.error_only;
             let plan = ocpp_log_query_plan(
                 limit,
-                location.as_deref(),
-                message_type.as_deref(),
-                from.as_deref(),
-                to.as_deref(),
+                list.location.as_deref(),
+                list.message_type.as_deref(),
+                list.from.as_deref(),
+                list.to.as_deref(),
                 error_only,
                 Utc::now(),
             )?;
@@ -1146,7 +1125,7 @@ async fn execute_cached_log_command<S: SessionStore>(
                 freshness,
             ))
         }
-        LogCommand::Ocpi { limit } => {
+        Some(LogCommand::Ocpi { limit }) => {
             let limit = *limit;
             Ok(Output::JsonArray(
                 "ocpi_logs",
@@ -1253,24 +1232,12 @@ fn cache_warn(cli: &Cli, cache: &mut CacheHandle, error: &str) {
     cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 }
 
-async fn execute_entity_command(
-    client: &mut MobieClient,
-    command: &EntityCommand,
-) -> Result<Output, AppError> {
-    match command {
-        EntityCommand::Get { code } => {
-            Ok(Output::JsonObject("entity", client.get_entity(code).await?))
-        }
-    }
+async fn execute_entity_command(client: &mut MobieClient, code: &str) -> Result<Output, AppError> {
+    Ok(Output::JsonObject("entity", client.get_entity(code).await?))
 }
 
-async fn execute_role_command(
-    client: &mut MobieClient,
-    command: &RoleCommand,
-) -> Result<Output, AppError> {
-    match command {
-        RoleCommand::Get { role } => Ok(Output::JsonObject("role", client.get_role(role).await?)),
-    }
+async fn execute_role_command(client: &mut MobieClient, role: &str) -> Result<Output, AppError> {
+    Ok(Output::JsonObject("role", client.get_role(role).await?))
 }
 
 async fn execute_ord_command(
@@ -1278,7 +1245,6 @@ async fn execute_ord_command(
     command: &OrdCommand,
 ) -> Result<Output, AppError> {
     match command {
-        OrdCommand::List => Ok(Output::JsonArray("ords", client.list_ords().await?)),
         OrdCommand::Statistics => Ok(Output::JsonObject(
             "ord_statistics",
             client.get_ord_statistics().await?,
@@ -1583,26 +1549,18 @@ async fn login_with_cli_credentials(
         .email
         .as_deref()
         .ok_or(AppError::MissingCredential("MOBIE_EMAIL", "email"))?;
-    let password = cli
-        .password
-        .as_deref()
+    let password = password_from_sources(cli)
         .ok_or(AppError::MissingCredential("MOBIE_PASSWORD", "password"))?;
-    Ok(client.login(email, password).await?)
+    Ok(client.login(email, &password).await?)
 }
 
 fn has_explicit_credentials(cli: &Cli) -> bool {
-    cli.email.is_some() || cli.password.is_some()
-}
-
-fn password_supplied_via_argv() -> bool {
-    std::env::args_os().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg == "--password" || arg.starts_with("--password=")
-    })
+    cli.email.is_some() || password_from_sources(cli).is_some()
 }
 
 fn collect_login_credentials(cli: &Cli) -> Result<(String, String), AppError> {
     if has_explicit_credentials(cli) {
+        let password = password_from_sources(cli);
         let email = cli
             .email
             .as_deref()
@@ -1610,8 +1568,7 @@ fn collect_login_credentials(cli: &Cli) -> Result<(String, String), AppError> {
             .filter(|value| !value.is_empty())
             .ok_or(AppError::MissingCredential("MOBIE_EMAIL", "email"))?
             .to_string();
-        let password = cli
-            .password
+        let password = password
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1630,8 +1587,8 @@ fn collect_login_credentials(cli: &Cli) -> Result<(String, String), AppError> {
         None => prompt("Email: ")?,
     };
 
-    let password = match cli
-        .password
+    let env_password = password_from_sources(cli);
+    let password = match env_password
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1671,6 +1628,83 @@ fn prompt(label: &str) -> Result<String, AppError> {
         )));
     }
     Ok(value)
+}
+
+fn password_from_sources(cli: &Cli) -> Option<String> {
+    cli.password
+        .clone()
+        .or_else(|| std::env::var("MOBIE_PASSWORD").ok())
+}
+
+fn load_app_config() -> Result<AppConfig, AppError> {
+    load_app_config_from(default_config_path()?)
+}
+
+fn load_app_config_from(path: PathBuf) -> Result<AppConfig, AppError> {
+    let Some(raw) = read_optional_file(&path)? else {
+        return Ok(AppConfig::default());
+    };
+
+    toml::from_str(&raw).map_err(|err| {
+        AppError::InvalidInput(format!("invalid config file {}: {err}", path.display()))
+    })
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<String>, AppError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(AppError::InvalidInput(format!(
+            "failed to read config file {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn default_config_path() -> Result<PathBuf, AppError> {
+    default_config_path_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn default_config_path_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, AppError> {
+    if let Some(dir) = xdg_config_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir).join("mobie").join("config.toml"));
+    }
+
+    let home = home.ok_or_else(|| {
+        AppError::InvalidInput(
+            "failed to determine config path: set XDG_CONFIG_HOME or HOME".to_string(),
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("mobie")
+        .join("config.toml"))
+}
+
+fn resolve_required_location(
+    location: Option<&str>,
+    config: &AppConfig,
+    missing_message: &str,
+) -> Result<String, AppError> {
+    if let Some(value) = non_empty_trimmed(location) {
+        return Ok(value.to_string());
+    }
+
+    if let Some(value) = non_empty_trimmed(config.default_location.as_deref()) {
+        return Ok(value.to_string());
+    }
+
+    Err(AppError::InvalidInput(missing_message.to_string()))
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn parse_session_filters(from: Option<&str>, to: Option<&str>) -> Result<SessionFilters, AppError> {
@@ -3180,6 +3214,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_config_path_prefers_xdg_config_home() {
+        let path =
+            default_config_path_from(Some("/tmp/xdg".into()), Some("/tmp/home".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg/mobie/config.toml"));
+    }
+
+    #[test]
+    fn default_config_path_falls_back_to_home_config_dir() {
+        let path = default_config_path_from(None, Some("/tmp/home".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/home/.config/mobie/config.toml"));
+    }
+
+    #[test]
+    fn resolve_location_uses_config_default_when_flag_missing() {
+        let config = AppConfig {
+            default_location: Some("EVSE-42".into()),
+        };
+
+        assert_eq!(
+            resolve_required_location(None, &config, "missing location").unwrap(),
+            "EVSE-42"
+        );
+    }
+
+    #[test]
+    fn resolve_location_rejects_missing_flag_and_config() {
+        let err =
+            resolve_required_location(None, &AppConfig::default(), "missing location").unwrap_err();
+        assert!(err.to_string().contains("missing location"));
+    }
+
     fn stored_session(base_url: &str, token: &str, refresh_token: Option<&str>) -> StoredSession {
         StoredSession {
             base_url: base_url.to_string(),
@@ -3212,7 +3278,7 @@ mod tests {
             &cli(
                 "https://pgm.mobie.pt",
                 Command::Auth {
-                    command: AuthCommand::Status,
+                    command: Some(AuthCommand::Status),
                 },
             ),
             &store,
@@ -3245,7 +3311,7 @@ mod tests {
             &cli(
                 "https://pgm.mobie.pt",
                 Command::Auth {
-                    command: AuthCommand::Logout,
+                    command: Some(AuthCommand::Logout),
                 },
             ),
             &store,
@@ -3299,7 +3365,7 @@ mod tests {
                 toon: false,
                 pretty: false,
                 command: Command::Auth {
-                    command: AuthCommand::Check,
+                    command: Some(AuthCommand::Check),
                 },
             },
             &store,
@@ -3369,7 +3435,7 @@ mod tests {
             &cli(
                 &server.uri(),
                 Command::Auth {
-                    command: AuthCommand::Check,
+                    command: Some(AuthCommand::Check),
                 },
             ),
             &store,
@@ -3402,7 +3468,7 @@ mod tests {
             toon: false,
             pretty: false,
             command: Command::Auth {
-                command: AuthCommand::Login,
+                command: Some(AuthCommand::Login),
             },
         })
         .unwrap_err();

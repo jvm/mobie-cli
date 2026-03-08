@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::Command;
 
 use tempfile::tempdir;
@@ -32,6 +33,12 @@ fn cli(server: &MockServer) -> Command {
     cmd.env("MOBIE_PASSWORD", "secret");
     cmd.env("MOBIE_CACHE_DIR", cache_dir);
     cmd
+}
+
+fn write_config(dir: &std::path::Path, contents: &str) {
+    let config_dir = dir.join("mobie");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), contents).unwrap();
 }
 
 #[tokio::test]
@@ -95,7 +102,7 @@ async fn locations_list_json_returns_counted_array() {
 
     let output = cli(&server)
         .arg("--json")
-        .args(["locations", "list"])
+        .args(["locations"])
         .output()
         .expect("run mobie");
 
@@ -127,7 +134,7 @@ async fn locations_get_json_returns_single_object() {
 
     let output = cli(&server)
         .arg("--json")
-        .args(["locations", "get", "--location", "MOBI-AAA-00001"])
+        .args(["location", "MOBI-AAA-00001"])
         .output()
         .expect("run mobie");
 
@@ -190,7 +197,7 @@ async fn sessions_list_json_collects_all_pages() {
 
     let output = cli(&server)
         .arg("--json")
-        .args(["sessions", "list", "--location", "EVSE-1", "--limit", "2"])
+        .args(["sessions", "EVSE-1", "--limit", "2"])
         .output()
         .expect("run mobie");
 
@@ -201,6 +208,61 @@ async fn sessions_list_json_collects_all_pages() {
     // With oldest-first ordering, sess-2 (Jan 1) comes before sess-1 (Jan 2)
     assert_eq!(body["data"][0]["id"], "sess-2");
     assert_eq!(body["data"][1]["id"], "sess-1");
+}
+
+#[tokio::test]
+async fn sessions_list_uses_default_location_from_xdg_config() {
+    let server = MockServer::start().await;
+    mount_login(&server).await;
+    let xdg_dir = tempdir().unwrap();
+    write_config(xdg_dir.path(), "default_location = \"EVSE-99\"\n");
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "0"))
+        .and(query_param("locationId", "EVSE-99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {
+                    "id": "sess-1",
+                    "start_date_time": "2025-01-01T10:00:00Z",
+                    "status": "COMPLETED"
+                }
+            ],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/sessions"))
+        .and(query_param("limit", "2"))
+        .and(query_param("offset", "1"))
+        .and(query_param("locationId", "EVSE-99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [],
+            "status_code": 1000,
+            "status_message": "Success",
+            "timestamp": "2025-01-01T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let output = cli(&server)
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
+        .arg("--json")
+        .args(["sessions", "--limit", "2"])
+        .output()
+        .expect("run mobie");
+
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["resource"], "sessions");
+    assert_eq!(body["meta"]["count"], 1);
+    assert_eq!(body["data"][0]["id"], "sess-1");
 }
 
 #[tokio::test]
@@ -259,8 +321,6 @@ async fn sessions_list_json_sends_api_date_filters() {
         .arg("--json")
         .args([
             "sessions",
-            "list",
-            "--location",
             "EVSE-1",
             "--limit",
             "10",
@@ -317,7 +377,7 @@ async fn tokens_and_logs_queries_work() {
 
     let tokens = cli(&server)
         .arg("--json")
-        .args(["tokens", "list", "--limit", "2"])
+        .args(["tokens", "--limit", "2"])
         .output()
         .expect("run mobie");
 
@@ -373,7 +433,6 @@ async fn tokens_and_logs_queries_work() {
         .arg("--json")
         .args([
             "logs",
-            "list",
             "--limit",
             "2",
             "--error-only",
@@ -404,7 +463,6 @@ async fn logs_list_rejects_ranges_longer_than_seven_days() {
         .arg("--json")
         .args([
             "logs",
-            "list",
             "--location",
             "MOBI-AAA-00001",
             "--from",
@@ -418,6 +476,47 @@ async fn logs_list_rejects_ranges_longer_than_seven_days() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("7 days or less"), "stderr was: {stderr}");
+}
+
+#[test]
+fn sessions_list_without_location_or_config_shows_terminal_error() {
+    let xdg_dir = tempdir().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_BASE_URL", "https://pgm.mobie.pt")
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
+        .args(["sessions"])
+        .output()
+        .expect("run mobie");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("location is mandatory"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("config.toml"), "stderr was: {stderr}");
+}
+
+#[test]
+fn locations_get_without_location_or_config_shows_terminal_error() {
+    let xdg_dir = tempdir().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("mobie"))
+        .env("MOBIE_BASE_URL", "https://pgm.mobie.pt")
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
+        .args(["location"])
+        .output()
+        .expect("run mobie");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("location is mandatory"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("mobie location <LOCATION_ID>"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -439,7 +538,7 @@ async fn human_output_stays_readable() {
         .await;
 
     let output = cli(&server)
-        .args(["locations", "list"])
+        .args(["locations"])
         .output()
         .expect("run mobie");
 
@@ -476,10 +575,7 @@ async fn ords_list_human_output_is_markdown() {
         .mount(&server)
         .await;
 
-    let output = cli(&server)
-        .args(["ords", "list"])
-        .output()
-        .expect("run mobie");
+    let output = cli(&server).args(["ords"]).output().expect("run mobie");
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -509,7 +605,7 @@ async fn markdown_option_emits_raw_markdown() {
         .await;
 
     let output = cli(&server)
-        .args(["--markdown", "locations", "list"])
+        .args(["--markdown", "locations"])
         .output()
         .expect("run mobie");
 
@@ -545,7 +641,7 @@ async fn toon_option_emits_toon() {
         .await;
 
     let output = cli(&server)
-        .args(["--toon", "ords", "list"])
+        .args(["--toon", "ords"])
         .output()
         .expect("run mobie");
 
