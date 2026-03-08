@@ -41,6 +41,7 @@ pub struct MobieClient {
     base_url: String,
     http: reqwest::Client,
     access: Option<AccessContext>,
+    login: Option<LoginResponse>,
 }
 
 impl MobieClient {
@@ -60,6 +61,7 @@ impl MobieClient {
             base_url,
             http,
             access: None,
+            login: None,
         })
     }
 
@@ -72,8 +74,22 @@ impl MobieClient {
         self
     }
 
+    pub fn with_login_response(mut self, login: LoginResponse) -> Self {
+        self.login = Some(login);
+        self
+    }
+
+    pub fn with_login_response_option(mut self, login: Option<LoginResponse>) -> Self {
+        self.login = login;
+        self
+    }
+
     pub fn access_context(&self) -> Option<&AccessContext> {
         self.access.as_ref()
+    }
+
+    pub fn login_response(&self) -> Option<&LoginResponse> {
+        self.login.as_ref()
     }
 
     async fn authed_headers(&mut self) -> Result<HeaderMap, MobieApiError> {
@@ -145,7 +161,9 @@ impl MobieClient {
         }
 
         let env: ApiEnvelope<LoginResponse> = res.json().await?;
-        self.access = Some(access_context_from_login(env.data));
+        let login = env.data;
+        self.access = Some(access_context_from_login(&login));
+        self.login = Some(login);
         Ok(())
     }
 
@@ -181,9 +199,11 @@ impl MobieClient {
         }
 
         let env: ApiEnvelope<LoginResponse> = res.json().await?;
-        let access = access_context_from_login(env.data);
+        let login = env.data;
+        let access = access_context_from_login(&login);
 
         self.access = Some(access.clone());
+        self.login = Some(login);
         info!(duration_ms, profile = %access.profile, "api_login_success");
         Ok(access)
     }
@@ -737,8 +757,9 @@ fn is_loopback_http_url(url: &Url) -> bool {
             .unwrap_or(false)
 }
 
-fn access_context_from_login(login: LoginResponse) -> AccessContext {
-    let LoginResponse { bearer, user } = login;
+fn access_context_from_login(login: &LoginResponse) -> AccessContext {
+    let bearer = &login.bearer;
+    let user = &login.user;
     let profile = user
         .roles
         .as_ref()
@@ -749,10 +770,10 @@ fn access_context_from_login(login: LoginResponse) -> AccessContext {
     });
 
     AccessContext {
-        user_email: user.email,
+        user_email: user.email.clone(),
         profile,
-        access_token: bearer.access_token,
-        refresh_token: bearer.refresh_token,
+        access_token: bearer.access_token.clone(),
+        refresh_token: bearer.refresh_token.clone(),
         expires_at_epoch_ms: expires_at,
     }
 }

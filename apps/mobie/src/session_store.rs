@@ -1,5 +1,6 @@
 use keyring::Entry;
 use mobie_api::AccessContext;
+use mobie_models::LoginResponse;
 use serde::{Deserialize, Serialize};
 
 const SERVICE_NAME: &str = "dev.mocito.mobie-cli";
@@ -8,6 +9,8 @@ const SERVICE_NAME: &str = "dev.mocito.mobie-cli";
 pub struct StoredSession {
     pub base_url: String,
     pub access: AccessContext,
+    #[serde(default)]
+    pub login: Option<LoginResponse>,
 }
 
 pub trait SessionStore {

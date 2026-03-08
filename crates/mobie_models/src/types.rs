@@ -26,13 +26,25 @@ pub struct Bearer {
     pub not_before_policy: Option<i64>,
     pub session_state: Option<String>,
     pub scope: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub email: String,
+    #[serde(rename = "firstName")]
+    pub first_name: Option<String>,
+    #[serde(rename = "lastName")]
+    pub last_name: Option<String>,
+    pub disabled: Option<bool>,
     pub entity: Option<String>,
+    pub frontend: Option<bool>,
     pub roles: Option<Vec<UserRole>>,
+    #[serde(rename = "idpID")]
+    pub idp_id: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +52,8 @@ pub struct UserRole {
     pub profile: Option<String>,
     pub role: Option<String>,
     pub name: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

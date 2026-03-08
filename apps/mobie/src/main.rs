@@ -15,7 +15,9 @@ use cache::{
 use chrono::{DateTime, Days, Duration, SecondsFormat, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand};
 use mobie_api::{AccessContext, MobieApiError, MobieClient, OcppLogFilters, SessionFilters};
-use mobie_models::{LocationDetail, LocationSummary, OcppLogEntry, Session, TokenInfo};
+use mobie_models::{
+    LocationDetail, LocationSummary, LoginResponse, OcppLogEntry, Session, TokenInfo, UserRole,
+};
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -124,11 +126,11 @@ enum Command {
     },
     Entity {
         /// Entity code.
-        code: String,
+        code: Option<String>,
     },
     Role {
-        /// Role code.
-        role: String,
+        /// Role name.
+        role: Option<String>,
     },
     Location {
         /// Location id. Falls back to default_location from config.toml when omitted.
@@ -267,6 +269,10 @@ struct AuthStatusResponse {
     email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roles: Option<Vec<UserRole>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     has_refresh_token: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -479,6 +485,41 @@ impl AuthResponse {
     }
 }
 
+fn stored_entity(session: &StoredSession) -> Option<&str> {
+    session
+        .login
+        .as_ref()
+        .and_then(|login| login.user.entity.as_deref())
+}
+
+fn stored_roles(session: &StoredSession) -> Option<&[UserRole]> {
+    session
+        .login
+        .as_ref()
+        .and_then(|login| login.user.roles.as_deref())
+}
+
+fn summarize_user_role(role: &UserRole) -> String {
+    let name = role.name.as_deref().unwrap_or("-");
+    let profile = role.profile.as_deref().unwrap_or("-");
+    let label = role.role.as_deref().unwrap_or("-");
+    format!("{name} [{profile}] {label}")
+}
+
+fn summarize_roles(roles: Option<&[UserRole]>) -> Option<String> {
+    roles.map(|roles| {
+        if roles.is_empty() {
+            "-".to_string()
+        } else {
+            roles
+                .iter()
+                .map(summarize_user_role)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -522,13 +563,13 @@ async fn execute_with_store<S: SessionStore>(
         }
         Command::Entity { code } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_entity_command(&mut authed.client, code).await?;
+            let output = execute_entity_command(&mut authed.client, code.as_deref()).await?;
             persist_session_if_needed(store, cli, &authed)?;
             Ok(output)
         }
         Command::Role { role } => {
             let mut authed = resolve_authenticated_client(cli, store).await?;
-            let output = execute_role_command(&mut authed.client, role).await?;
+            let output = execute_role_command(&mut authed.client, role.as_deref()).await?;
             persist_session_if_needed(store, cli, &authed)?;
             Ok(output)
         }
@@ -587,7 +628,12 @@ async fn execute_auth_command<S: SessionStore>(
             let (email, password) = collect_login_credentials(cli)?;
             let mut client = MobieClient::new(&cli.base_url)?;
             let access = client.login(&email, &password).await?;
-            save_session(store, &cli.base_url, access.clone())?;
+            save_session(
+                store,
+                &cli.base_url,
+                access.clone(),
+                client.login_response().cloned(),
+            )?;
             Ok(Output::Auth(AuthResponse::from_access(
                 &cli.base_url,
                 "login",
@@ -595,19 +641,27 @@ async fn execute_auth_command<S: SessionStore>(
             )))
         }
         AuthCommand::Status => match store.load(&cli.base_url).map_err(AppError::SecretStore)? {
-            Some(session) => Ok(Output::AuthStatus(AuthStatusResponse {
-                stored: true,
-                base_url: session.base_url,
-                email: Some(session.access.user_email),
-                profile: Some(session.access.profile),
-                has_refresh_token: Some(session.access.refresh_token.is_some()),
-                expires_at_epoch_ms: session.access.expires_at_epoch_ms,
-            })),
+            Some(session) => {
+                let entity = stored_entity(&session).map(str::to_string);
+                let roles = stored_roles(&session).map(|roles| roles.to_vec());
+                Ok(Output::AuthStatus(AuthStatusResponse {
+                    stored: true,
+                    base_url: session.base_url,
+                    email: Some(session.access.user_email),
+                    profile: Some(session.access.profile),
+                    entity,
+                    roles,
+                    has_refresh_token: Some(session.access.refresh_token.is_some()),
+                    expires_at_epoch_ms: session.access.expires_at_epoch_ms,
+                }))
+            }
             None => Ok(Output::AuthStatus(AuthStatusResponse {
                 stored: false,
                 base_url: canonical_base_url(&cli.base_url),
                 email: None,
                 profile: None,
+                entity: None,
+                roles: None,
                 has_refresh_token: None,
                 expires_at_epoch_ms: None,
             })),
@@ -1232,12 +1286,67 @@ fn cache_warn(cli: &Cli, cache: &mut CacheHandle, error: &str) {
     cache.warn_if_unavailable(!cli.json && !cli.markdown && !cli.toon);
 }
 
-async fn execute_entity_command(client: &mut MobieClient, code: &str) -> Result<Output, AppError> {
-    Ok(Output::JsonObject("entity", client.get_entity(code).await?))
+async fn execute_entity_command(
+    client: &mut MobieClient,
+    code: Option<&str>,
+) -> Result<Output, AppError> {
+    let code = match code {
+        Some(code) => code.to_string(),
+        None => client
+            .login_response()
+            .and_then(|login| login.user.entity.clone())
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "entity is missing from the stored login metadata; pass `mobie entity <ENTITY_CODE>` or refresh the stored login with `mobie auth login`".into(),
+                )
+            })?,
+    };
+
+    Ok(Output::JsonObject(
+        "entity",
+        client.get_entity(&code).await?,
+    ))
 }
 
-async fn execute_role_command(client: &mut MobieClient, role: &str) -> Result<Output, AppError> {
-    Ok(Output::JsonObject("role", client.get_role(role).await?))
+async fn execute_role_command(
+    client: &mut MobieClient,
+    role: Option<&str>,
+) -> Result<Output, AppError> {
+    let role = match role {
+        Some(role) => role.to_string(),
+        None => {
+            let roles = client
+                .login_response()
+                .and_then(|login| login.user.roles.as_ref())
+                .ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "role metadata is missing from the stored login; pass `mobie role <ROLE_NAME>` or refresh the stored login with `mobie auth login`".into(),
+                    )
+                })?;
+
+            match roles.as_slice() {
+                [role] => role.name.clone().ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "stored login role is missing its role name; pass `mobie role <ROLE_NAME>` explicitly".into(),
+                    )
+                })?,
+                [] => {
+                    return Err(AppError::InvalidInput(
+                        "no roles were returned by login; pass `mobie role <ROLE_NAME>` explicitly"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    return Err(AppError::InvalidInput(
+                        "multiple roles are available; pass `mobie role <ROLE_NAME>` explicitly"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    };
+
+    Ok(Output::JsonObject("role", client.get_role(&role).await?))
 }
 
 async fn execute_ord_command(
@@ -1275,7 +1384,9 @@ async fn resolve_authenticated_client<S: SessionStore>(
 
     if let Some(session) = store.load(&cli.base_url).map_err(AppError::SecretStore)? {
         return Ok(AuthenticatedClient {
-            client: MobieClient::new(&cli.base_url)?.with_access(session.access),
+            client: MobieClient::new(&cli.base_url)?
+                .with_access(session.access)
+                .with_login_response_option(session.login),
             source: AuthSource::StoredSession,
         });
     }
@@ -1291,7 +1402,12 @@ fn persist_session_if_needed<S: SessionStore>(
     if matches!(authed.source, AuthSource::StoredSession)
         && let Some(access) = authed.client.access_context().cloned()
     {
-        save_session(store, &cli.base_url, access)?;
+        save_session(
+            store,
+            &cli.base_url,
+            access,
+            authed.client.login_response().cloned(),
+        )?;
     }
 
     Ok(())
@@ -1301,11 +1417,13 @@ fn save_session<S: SessionStore>(
     store: &S,
     base_url: &str,
     access: AccessContext,
+    login: Option<LoginResponse>,
 ) -> Result<(), AppError> {
     store
         .save(&StoredSession {
             base_url: canonical_base_url(base_url),
             access,
+            login,
         })
         .map_err(AppError::SecretStore)
 }
@@ -1937,6 +2055,11 @@ fn render_markdown_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                     "profile",
                     data.profile.clone().unwrap_or_else(|| "-".into()),
                 ),
+                ("entity", data.entity.clone().unwrap_or_else(|| "-".into())),
+                (
+                    "roles",
+                    summarize_roles(data.roles.as_deref()).unwrap_or_else(|| "-".into()),
+                ),
                 (
                     "has_refresh_token",
                     data.has_refresh_token
@@ -2075,6 +2198,11 @@ fn render_terminal_output(output: &Output) -> Result<(), Box<dyn std::error::Err
                 (
                     "profile",
                     data.profile.clone().unwrap_or_else(|| "-".into()),
+                ),
+                ("entity", data.entity.clone().unwrap_or_else(|| "-".into())),
+                (
+                    "roles",
+                    summarize_roles(data.roles.as_deref()).unwrap_or_else(|| "-".into()),
                 ),
             ]);
         }
@@ -3262,6 +3390,36 @@ mod tests {
                         + 60_000,
                 ),
             },
+            login: Some(LoginResponse {
+                bearer: mobie_models::Bearer {
+                    access_token: token.into(),
+                    expires_in: Some(3600),
+                    refresh_expires_in: Some(3600),
+                    refresh_token: refresh_token.map(str::to_string),
+                    token_type: Some("Bearer".into()),
+                    id_token: None,
+                    not_before_policy: Some(0),
+                    session_state: Some("session-1".into()),
+                    scope: Some("openid".into()),
+                    extra: serde_json::Value::Null,
+                },
+                user: mobie_models::User {
+                    email: "user@example.com".into(),
+                    first_name: Some("User".into()),
+                    last_name: Some("Example".into()),
+                    disabled: Some(false),
+                    entity: Some("0315".into()),
+                    frontend: Some(true),
+                    roles: Some(vec![UserRole {
+                        profile: Some("DPC".into()),
+                        role: Some("Operator".into()),
+                        name: Some("DPC_OPERATOR".into()),
+                        extra: serde_json::Value::Null,
+                    }]),
+                    idp_id: Some("user-id".into()),
+                    extra: serde_json::Value::Null,
+                },
+            }),
         }
     }
 
@@ -3292,6 +3450,8 @@ mod tests {
                 assert!(data.stored);
                 assert_eq!(data.email.as_deref(), Some("user@example.com"));
                 assert_eq!(data.profile.as_deref(), Some("DPC"));
+                assert_eq!(data.entity.as_deref(), Some("0315"));
+                assert_eq!(data.roles.as_ref().map(Vec::len), Some(1));
                 assert_eq!(data.has_refresh_token, Some(true));
             }
             _ => panic!("unexpected output"),
@@ -3399,6 +3559,36 @@ mod tests {
                 refresh_token: Some("refresh-1".into()),
                 expires_at_epoch_ms: Some(now_ms - 1_000),
             },
+            login: Some(LoginResponse {
+                bearer: mobie_models::Bearer {
+                    access_token: "old-token".into(),
+                    expires_in: Some(3600),
+                    refresh_expires_in: Some(3600),
+                    refresh_token: Some("refresh-1".into()),
+                    token_type: Some("Bearer".into()),
+                    id_token: None,
+                    not_before_policy: Some(0),
+                    session_state: Some("session-1".into()),
+                    scope: Some("openid".into()),
+                    extra: serde_json::Value::Null,
+                },
+                user: mobie_models::User {
+                    email: "user@example.com".into(),
+                    first_name: None,
+                    last_name: None,
+                    disabled: Some(false),
+                    entity: Some("0315".into()),
+                    frontend: Some(true),
+                    roles: Some(vec![UserRole {
+                        profile: Some("DPC".into()),
+                        role: Some("Operator".into()),
+                        name: Some("DPC_OPERATOR".into()),
+                        extra: serde_json::Value::Null,
+                    }]),
+                    idp_id: None,
+                    extra: serde_json::Value::Null,
+                },
+            }),
         });
         let mut cache = CacheHandle::new();
 
@@ -3455,6 +3645,117 @@ mod tests {
         let persisted = store.load(&server.uri()).unwrap().unwrap();
         assert_eq!(persisted.access.access_token, "new-token");
         assert_eq!(persisted.access.refresh_token.as_deref(), Some("refresh-2"));
+        assert_eq!(
+            persisted
+                .login
+                .as_ref()
+                .map(|login| login.user.email.as_str()),
+            Some("user@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_without_argument_uses_stored_login_entity() {
+        let server = MockServer::start().await;
+        let store =
+            MockStore::with_session(stored_session(&server.uri(), "token-1", Some("refresh-1")));
+        let mut cache = CacheHandle::new();
+
+        Mock::given(method("GET"))
+            .and(path("/api/entities/0315"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"code": "0315"},
+                "status_code": 1000,
+                "status_message": "Success",
+                "timestamp": "2025-01-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = execute_with_store(
+            &cli(&server.uri(), Command::Entity { code: None }),
+            &store,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        match output {
+            Output::JsonObject(resource, data) => {
+                assert_eq!(resource, "entity");
+                assert_eq!(data["code"], "0315");
+            }
+            _ => panic!("unexpected output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn role_without_argument_uses_only_stored_role_name() {
+        let server = MockServer::start().await;
+        let store =
+            MockStore::with_session(stored_session(&server.uri(), "token-1", Some("refresh-1")));
+        let mut cache = CacheHandle::new();
+
+        Mock::given(method("GET"))
+            .and(path("/api/identity/roles/DPC_OPERATOR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"name": "DPC_OPERATOR"},
+                "status_code": 1000,
+                "status_message": "Success",
+                "timestamp": "2025-01-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = execute_with_store(
+            &cli(&server.uri(), Command::Role { role: None }),
+            &store,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        match output {
+            Output::JsonObject(resource, data) => {
+                assert_eq!(resource, "role");
+                assert_eq!(data["name"], "DPC_OPERATOR");
+            }
+            _ => panic!("unexpected output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn role_without_argument_requires_explicit_role_when_multiple_are_stored() {
+        let mut session = stored_session("https://pgm.mobie.pt", "token-1", Some("refresh-1"));
+        session
+            .login
+            .as_mut()
+            .and_then(|login| login.user.roles.as_mut())
+            .unwrap()
+            .push(UserRole {
+                profile: Some("ALT".into()),
+                role: Some("Viewer".into()),
+                name: Some("ALT_VIEWER".into()),
+                extra: serde_json::Value::Null,
+            });
+        let store = MockStore::with_session(session);
+        let mut cache = CacheHandle::new();
+
+        let err = match execute_with_store(
+            &cli("https://pgm.mobie.pt", Command::Role { role: None }),
+            &store,
+            &mut cache,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("multiple roles are available; pass `mobie role <ROLE_NAME>` explicitly")
+        );
     }
 
     #[test]
